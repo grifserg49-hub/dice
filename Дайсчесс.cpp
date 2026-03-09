@@ -1988,10 +1988,10 @@ static constexpr int POLICY_P = 73;
 static constexpr float BN_EPS = 1e-5f;
 
 // SE (affine)
-static constexpr int SE_CHANNELS = 16;   // для C=128 обычно 8..16; 16 сильнее
+static constexpr int SE_CHANNELS = 16;   // Г¤Г«Гї C=128 Г®ГЎГ»Г·Г­Г® 8..16; 16 Г±ГЁГ«ГјГ­ГҐГҐ
 
 // Heads
-static constexpr int HEAD_POLICY_C = 32; // 32 для 10x128 — стандартный хороший выбор
+static constexpr int HEAD_POLICY_C = 32; // 32 Г¤Г«Гї 10x128 В— Г±ГІГ Г­Г¤Г Г°ГІГ­Г»Г© ГµГ®Г°Г®ГёГЁГ© ГўГ»ГЎГ®Г°
 static constexpr int HEAD_VALUE_C = 32;
 static constexpr int HEAD_VALUE_FC = 256;
 static constexpr int POLICY_SIZE = 8 * 8 * POLICY_P; // 4672
@@ -2855,7 +2855,7 @@ struct TrtRunner {
                 total,
                 stream);
 
-            // по желанию на время отладки:
+            // ГЇГ® Г¦ГҐГ«Г Г­ГЁГѕ Г­Г  ГўГ°ГҐГ¬Гї Г®ГІГ«Г Г¤ГЄГЁ:
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -2971,15 +2971,15 @@ struct TrtRunner {
             shutdown();
         }
 
-        std::cout << "Файл TensorRT плана '" << planFile << "' не найден/не грузится — собираю движок...\n";
+        std::cout << "Г”Г Г©Г« TensorRT ГЇГ«Г Г­Г  '" << planFile << "' Г­ГҐ Г­Г Г©Г¤ГҐГ­/Г­ГҐ ГЈГ°ГіГ§ГЁГІГ±Гї В— Г±Г®ГЎГЁГ°Г Гѕ Г¤ГўГЁГ¦Г®ГЄ...\n";
         if (!buildAndSavePlan(planFile)) {
-            std::cerr << "Не удалось собрать и сохранить TensorRT plan '" << planFile << "'.\n";
+            std::cerr << "ГЌГҐ ГіГ¤Г Г«Г®Г±Гј Г±Г®ГЎГ°Г ГІГј ГЁ Г±Г®ГµГ°Г Г­ГЁГІГј TensorRT plan '" << planFile << "'.\n";
             return false;
         }
-        std::cout << "Собран и сохранён '" << planFile << "'. Загружаю...\n";
+        std::cout << "Г‘Г®ГЎГ°Г Г­ ГЁ Г±Г®ГµГ°Г Г­ВёГ­ '" << planFile << "'. Г‡Г ГЈГ°ГіГ¦Г Гѕ...\n";
 
         if (!initFromPlan(planFile)) {
-            std::cerr << "Не удалось загрузить TensorRT plan после сборки.\n";
+            std::cerr << "ГЌГҐ ГіГ¤Г Г«Г®Г±Гј Г§Г ГЈГ°ГіГ§ГЁГІГј TensorRT plan ГЇГ®Г±Г«ГҐ Г±ГЎГ®Г°ГЄГЁ.\n";
             shutdown();
             return false;
         }
@@ -3059,7 +3059,7 @@ struct TrtRunner {
                 total,
                 stream);
 
-            // по желанию на время отладки:
+            // ГЇГ® Г¦ГҐГ«Г Г­ГЁГѕ Г­Г  ГўГ°ГҐГ¬Гї Г®ГІГ«Г Г¤ГЄГЁ:
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -3159,20 +3159,20 @@ static AI_FORCEINLINE void cpuRelax() {
 // -------------------------------
 // Time-based backoff wait helpers
 // -------------------------------
-static constexpr int64_t AI_LOCK_WAIT_US = 2000;   // 2ms (как было)
+static constexpr int64_t AI_LOCK_WAIT_US = 2000;   // 2ms (ГЄГ ГЄ ГЎГ»Г«Г®)
 static constexpr int64_t AI_EXPAND_WAIT_US = 100000;
 
 static AI_FORCEINLINE void backoffWait(int& spins) {
     cpuRelax();
     ++spins;
 
-    // ВАЖНО: никаких sleep_for(microseconds) — на многих ОС это вырождается в ~1ms.
-    // Yield делаем редко, чтобы не терять throughput.
+    // Г‚ГЂГ†ГЌГЋ: Г­ГЁГЄГ ГЄГЁГµ sleep_for(microseconds) В— Г­Г  Г¬Г­Г®ГЈГЁГµ ГЋГ‘ ГЅГІГ® ГўГ»Г°Г®Г¦Г¤Г ГҐГІГ±Гї Гў ~1ms.
+    // Yield Г¤ГҐГ«Г ГҐГ¬ Г°ГҐГ¤ГЄГ®, Г·ГІГ®ГЎГ» Г­ГҐ ГІГҐГ°ГїГІГј throughput.
     if (spins == 256 || spins == 1024 || spins == 4096) {
         std::this_thread::yield();
     }
     if (spins > 16384) {
-        // если очень долго — начинаем yield чаще, но всё равно без сна
+        // ГҐГ±Г«ГЁ Г®Г·ГҐГ­Гј Г¤Г®Г«ГЈГ® В— Г­Г Г·ГЁГ­Г ГҐГ¬ yield Г·Г Г№ГҐ, Г­Г® ГўГ±Вё Г°Г ГўГ­Г® ГЎГҐГ§ Г±Г­Г 
         std::this_thread::yield();
     }
 }
@@ -3367,21 +3367,21 @@ struct MCTSTable {
                 Clock::time_point lockStart = Clock::time_point{};
                 uint64_t lockStartIdx = ~0ull;
 
-                // фиксируем "начало ожидания" для конкретного слота idx
+                // ГґГЁГЄГ±ГЁГ°ГіГҐГ¬ "Г­Г Г·Г Г«Г® Г®Г¦ГЁГ¤Г Г­ГЁГї" Г¤Г«Гї ГЄГ®Г­ГЄГ°ГҐГІГ­Г®ГЈГ® Г±Г«Г®ГІГ  idx
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
                     lockStart = Clock::now();
                     lockSpins = 0;
                 }
 
-                // ждём, но ограниченно по времени
+                // Г¦Г¤ВёГ¬, Г­Г® Г®ГЈГ°Г Г­ГЁГ·ГҐГ­Г­Г® ГЇГ® ГўГ°ГҐГ¬ГҐГ­ГЁ
                 if (Clock::now() - lockStart > std::chrono::microseconds(AI_LOCK_WAIT_US)) {
-                    // НИКАКОГО abort: просто сдаёмся на эту попытку (симуляция может повториться)
+                    // ГЌГ€ГЉГЂГЉГЋГѓГЋ abort: ГЇГ°Г®Г±ГІГ® Г±Г¤Г ВёГ¬Г±Гї Г­Г  ГЅГІГі ГЇГ®ГЇГ»ГІГЄГі (Г±ГЁГ¬ГіГ«ГїГ¶ГЁГї Г¬Г®Г¦ГҐГІ ГЇГ®ГўГІГ®Г°ГЁГІГјГ±Гї)
                     return nullptr;
                 }
 
                 backoffWait(lockSpins);
-                continue; // IMPORTANT: не двигаем idx и не увеличиваем probe
+                continue; // IMPORTANT: Г­ГҐ Г¤ГўГЁГЈГ ГҐГ¬ idx ГЁ Г­ГҐ ГіГўГҐГ«ГЁГ·ГЁГўГ ГҐГ¬ probe
             }
             lockSpins = 0;
 
@@ -3482,7 +3482,7 @@ static AI_FORCEINLINE float edgeQ(const TTEdge& e) {
     return clamp01((float)(e.sum() / (double)v));
 }
 
-// Выбор PV: сначала max visits, затем max Q, затем max prior.
+// Г‚Г»ГЎГ®Г° PV: Г±Г­Г Г·Г Г«Г  max visits, Г§Г ГІГҐГ¬ max Q, Г§Г ГІГҐГ¬ max prior.
 static AI_FORCEINLINE int selectBestPVEdge(const TTNode& n, const TTEdge* e0) {
     int bestI = 0;
     uint32_t bestV = 0;
@@ -3507,7 +3507,7 @@ static AI_FORCEINLINE int selectBestPVEdge(const TTNode& n, const TTEdge* e0) {
     return bestI;
 }
 
-// Перевод "value для side-to-move" -> "value для белых"
+// ГЏГҐГ°ГҐГўГ®Г¤ "value Г¤Г«Гї side-to-move" -> "value Г¤Г«Гї ГЎГҐГ«Г»Гµ"
 static AI_FORCEINLINE float toWhitePerspective(float qSideToMove, int sideToMove) {
     // sideToMove: 0=white, 1=black
     return (sideToMove == 0) ? qSideToMove : (1.0f - qSideToMove);
@@ -3525,31 +3525,31 @@ static float evalOnePVNoExpandWhite(MCTSTable& T,
 
         uint8_t ex = n->expanded.load(std::memory_order_acquire);
         if (ex != 1) {
-            // Не ждём, не расширяем — просто используем то, что есть.
+            // ГЌГҐ Г¦Г¤ВёГ¬, Г­ГҐ Г°Г Г±ГёГЁГ°ГїГҐГ¬ В— ГЇГ°Г®Г±ГІГ® ГЁГ±ГЇГ®Г«ГјГ§ГіГҐГ¬ ГІГ®, Г·ГІГ® ГҐГ±ГІГј.
             float q = nodeQ(*n);
             return toWhitePerspective(q, pos.side);
         }
 
         if (n->terminal) {
-            // В твоей логике terminal бэкапится как v=1.0 (выигрыш side-to-move).
+            // Г‚ ГІГўГ®ГҐГ© Г«Г®ГЈГЁГЄГҐ terminal ГЎГЅГЄГ ГЇГЁГІГ±Гї ГЄГ ГЄ v=1.0 (ГўГ»ГЁГЈГ°Г»Гё side-to-move).
             float q = 1.0f;
             return toWhitePerspective(q, pos.side);
         }
 
         if (n->edgeCount == 0) {
             if (n->chance) {
-                // Chance-узел: кидаем "кости" как в основном дереве.
+                // Chance-ГіГ§ГҐГ«: ГЄГЁГ¤Г ГҐГ¬ "ГЄГ®Г±ГІГЁ" ГЄГ ГЄ Гў Г®Г±Г­Г®ГўГ­Г®Г¬ Г¤ГҐГ°ГҐГўГҐ.
                 makeRandom(pos,n);
                 continue;
             }
             else {
-                // Узел без ходов, но не chance: берём средний Q узла.
+                // Г“Г§ГҐГ« ГЎГҐГ§ ГµГ®Г¤Г®Гў, Г­Г® Г­ГҐ chance: ГЎГҐГ°ВёГ¬ Г±Г°ГҐГ¤Г­ГЁГ© Q ГіГ§Г«Г .
                 float q = nodeQ(*n);
                 return toWhitePerspective(q, pos.side);
             }
         }
 
-        // Decision-узел: идём по PV
+        // Decision-ГіГ§ГҐГ«: ГЁГ¤ВёГ¬ ГЇГ® PV
         TTEdge* e0 = T.edgePtr(n->edgeBegin);
         int bi = selectBestPVEdge(*n, e0);
         int m = e0[bi].move;
@@ -3557,7 +3557,7 @@ static float evalOnePVNoExpandWhite(MCTSTable& T,
         makeMove(pos, mask, m);
     }
 
-    // Если упёрлись в maxDepth — оценим текущий узел как есть
+    // Г…Г±Г«ГЁ ГіГЇВёГ°Г«ГЁГ±Гј Гў maxDepth В— Г®Г¶ГҐГ­ГЁГ¬ ГІГҐГЄГіГ№ГЁГ© ГіГ§ГҐГ« ГЄГ ГЄ ГҐГ±ГІГј
     TTNode* n = T.findNodeNoInsert(pos.key);
     if (!n) return 0.5f;
     float q = nodeQ(*n);
@@ -3627,9 +3627,9 @@ static AI_FORCEINLINE int selectPUCT(const TTNode& n,
 static constexpr int MCTS_MAX_DEPTH = 256;
 
 // Classic virtual loss
-static constexpr uint32_t VLOSS_N = 1;     // обычно 1; 2-3 имеет смысл только при очень многих потоках
-static constexpr float    VLOSS_VALUE = 0.0f; // value в шкале [0..1]; 0.0 = "loss for side-to-move"
-static constexpr bool     VLOSS_BUMP_NODE_VISITS = false; // опционально
+static constexpr uint32_t VLOSS_N = 1;     // Г®ГЎГ»Г·Г­Г® 1; 2-3 ГЁГ¬ГҐГҐГІ Г±Г¬Г»Г±Г« ГІГ®Г«ГјГЄГ® ГЇГ°ГЁ Г®Г·ГҐГ­Гј Г¬Г­Г®ГЈГЁГµ ГЇГ®ГІГ®ГЄГ Гµ
+static constexpr float    VLOSS_VALUE = 0.0f; // value Гў ГёГЄГ Г«ГҐ [0..1]; 0.0 = "loss for side-to-move"
+static constexpr bool     VLOSS_BUMP_NODE_VISITS = false; // Г®ГЇГ¶ГЁГ®Г­Г Г«ГјГ­Г®
 
 struct TraceStep {
     TTNode* node = nullptr;
@@ -3668,16 +3668,16 @@ static AI_FORCEINLINE void applyVirtualLoss(TraceStep& s) {
 
     if (VLOSS_BUMP_NODE_VISITS && s.node) {
         s.node->visits.fetch_add(VLOSS_N, std::memory_order_relaxed);
-        // valueSum узла НЕ трогаем (классика)
+        // valueSum ГіГ§Г«Г  ГЌГ… ГІГ°Г®ГЈГ ГҐГ¬ (ГЄГ«Г Г±Г±ГЁГЄГ )
     }
 
     if (s.edge) {
         s.edge->visits.fetch_add(VLOSS_N, std::memory_order_relaxed);
-        // “loss” в [0..1] шкале => добавляем W как будто вернулся VLOSS_VALUE
+        // В“lossВ” Гў [0..1] ГёГЄГ Г«ГҐ => Г¤Г®ГЎГ ГўГ«ГїГҐГ¬ W ГЄГ ГЄ ГЎГіГ¤ГІГ® ГўГҐГ°Г­ГіГ«Г±Гї VLOSS_VALUE
         if (VLOSS_VALUE != 0.0f) {
             atomicAddDouble(s.edge->valueSum, (double)VLOSS_VALUE * (double)VLOSS_N);
         }
-        // если VLOSS_VALUE=0.0f, valueSum можно не трогать вообще
+        // ГҐГ±Г«ГЁ VLOSS_VALUE=0.0f, valueSum Г¬Г®Г¦Г­Г® Г­ГҐ ГІГ°Г®ГЈГ ГІГј ГўГ®Г®ГЎГ№ГҐ
     }
 }
 
@@ -4477,7 +4477,7 @@ void mctsBatchedMT(Position& rootPos,
                 int qs = nnServer.size();
                 throttleOnNNQueue_NoSleep(qs, throttleSpins);
 
-                // если очередь совсем огромная — не генерим новые leaf'ы прямо сейчас
+                // ГҐГ±Г«ГЁ Г®Г·ГҐГ°ГҐГ¤Гј Г±Г®ГўГ±ГҐГ¬ Г®ГЈГ°Г®Г¬Г­Г Гї В— Г­ГҐ ГЈГҐГ­ГҐГ°ГЁГ¬ Г­Г®ГўГ»ГҐ leaf'Г» ГЇГ°ГїГ¬Г® Г±ГҐГ©Г·Г Г±
                 if (qs > 2000) continue;
                 bool ok = runOneSim(T, rootPos, path, mask, rootNoise,
                     p, needNN,
@@ -4491,7 +4491,7 @@ void mctsBatchedMT(Position& rootPos,
                 simOK.fetch_add(1, std::memory_order_relaxed);
                 if (needNN) {
                     nnExp.fetch_add(1, std::memory_order_relaxed);
-                    nnServer.submit(std::move(p));   // сразу отправили => expanded=2 будет недолго
+                    nnServer.submit(std::move(p));   // Г±Г°Г Г§Гі Г®ГІГЇГ°Г ГўГЁГ«ГЁ => expanded=2 ГЎГіГ¤ГҐГІ Г­ГҐГ¤Г®Г«ГЈГ®
                 }
             }
 
@@ -4555,10 +4555,10 @@ void mctsBatchedMT(Position& rootPos,
 }
 
 // ===================== TRAINING PATCH BEGIN (FINAL) =====================
-// (продолжение будет в сообщении 2/2)
+// (ГЇГ°Г®Г¤Г®Г«Г¦ГҐГ­ГЁГҐ ГЎГіГ¤ГҐГІ Гў Г±Г®Г®ГЎГ№ГҐГ­ГЁГЁ 2/2)
 // ===================== TRAINING PATCH BEGIN (FINAL) =====================
-// ВСТАВЬ ЭТО ВМЕСТО ТВОЕГО ТЕКУЩЕГО `static void init()` И `int main()`
-// (т.е. удалить/заменить всё от `static void init()` до конца файла).
+// Г‚Г‘Г’ГЂГ‚Гњ ГќГ’ГЋ Г‚ГЊГ…Г‘Г’ГЋ Г’Г‚ГЋГ…ГѓГЋ Г’Г…ГЉГ“Г™Г…ГѓГЋ `static void init()` Г€ `int main()`
+// (ГІ.ГҐ. ГіГ¤Г Г«ГЁГІГј/Г§Г Г¬ГҐГ­ГЁГІГј ГўГ±Вё Г®ГІ `static void init()` Г¤Г® ГЄГ®Г­Г¶Г  ГґГ Г©Г«Г ).
 
 
 
@@ -4686,7 +4686,39 @@ struct NetImpl final : torch::nn::Module {
         v = v.contiguous().view({ v.size(0), HEAD_VALUE_C * 64 });
         v = torch::relu(valFC1->forward(v));
 
-        // Получаем сырые логиты
+struct ModelSnapshot {
+    std::unordered_map<std::string, torch::Tensor> params;
+    std::unordered_map<std::string, torch::Tensor> buffers;
+};
+
+static ModelSnapshot captureModelSnapshot(const Net& model) {
+    ModelSnapshot snap;
+    for (const auto& p : model->named_parameters(/*recurse=*/true)) {
+        snap.params[p.key()] = p.value().detach().cpu().clone();
+    }
+    for (const auto& b : model->named_buffers(/*recurse=*/true)) {
+        snap.buffers[b.key()] = b.value().detach().cpu().clone();
+    }
+    return snap;
+}
+
+static void loadModelSnapshot(Net& model, const ModelSnapshot& snap) {
+    torch::NoGradGuard ng;
+    for (auto& p : model->named_parameters(/*recurse=*/true)) {
+        auto it = snap.params.find(p.key());
+        if (it != snap.params.end()) {
+            p.value().copy_(it->second.to(p.value().device(), p.value().scalar_type()));
+        }
+    }
+    for (auto& b : model->named_buffers(/*recurse=*/true)) {
+        auto it = snap.buffers.find(b.key());
+        if (it != snap.buffers.end()) {
+            b.value().copy_(it->second.to(b.value().device(), b.value().scalar_type()));
+        }
+    }
+}
+
+        // ГЏГ®Г«ГіГ·Г ГҐГ¬ Г±Г»Г°Г»ГҐ Г«Г®ГЈГЁГІГ»
         v = valFC2->forward(v);
 
 
@@ -4721,10 +4753,10 @@ struct ReplayBuffer {
     size_t head = 0;
     size_t size = 0;
 
-    // Степень "свежести" данных (Prioritized Replay Lite).
-    // 1.0  = полностью равномерный выбор (как было).
-    // 0.75 = легкий приоритет свежим играм (золотая середина для AlphaZero).
-    // 0.5  = сильный перекос в сторону только что сыгранных партий.
+    // Г‘ГІГҐГЇГҐГ­Гј "Г±ГўГҐГ¦ГҐГ±ГІГЁ" Г¤Г Г­Г­Г»Гµ (Prioritized Replay Lite).
+    // 1.0  = ГЇГ®Г«Г­Г®Г±ГІГјГѕ Г°Г ГўГ­Г®Г¬ГҐГ°Г­Г»Г© ГўГ»ГЎГ®Г° (ГЄГ ГЄ ГЎГ»Г«Г®).
+    // 0.75 = Г«ГҐГЈГЄГЁГ© ГЇГ°ГЁГ®Г°ГЁГІГҐГІ Г±ГўГҐГ¦ГЁГ¬ ГЁГЈГ°Г Г¬ (Г§Г®Г«Г®ГІГ Гї Г±ГҐГ°ГҐГ¤ГЁГ­Г  Г¤Г«Гї AlphaZero).
+    // 0.5  = Г±ГЁГ«ГјГ­Г»Г© ГЇГҐГ°ГҐГЄГ®Г± Гў Г±ГІГ®Г°Г®Г­Гі ГІГ®Г«ГјГЄГ® Г·ГІГ® Г±Г»ГЈГ°Г Г­Г­Г»Гµ ГЇГ Г°ГІГЁГ©.
     double recent_bias = 0.75;
 
     std::mutex m;
@@ -4741,15 +4773,15 @@ struct ReplayBuffer {
     }
 
     bool sampleBatch(std::vector<TrainSample>& out, int B, std::mt19937& rng) {
-        // 1. Изменяем размер вектора ДО захвата мьютекса.
-        // Это убирает микро-фризы (Lock Contention), позволяя Self-play потокам
-        // быстрее складывать новые партии в буфер.
+        // 1. Г€Г§Г¬ГҐГ­ГїГҐГ¬ Г°Г Г§Г¬ГҐГ° ГўГҐГЄГІГ®Г°Г  Г„ГЋ Г§Г ГµГўГ ГІГ  Г¬ГјГѕГІГҐГЄГ±Г .
+        // ГќГІГ® ГіГЎГЁГ°Г ГҐГІ Г¬ГЁГЄГ°Г®-ГґГ°ГЁГ§Г» (Lock Contention), ГЇГ®Г§ГўГ®Г«ГїГї Self-play ГЇГ®ГІГ®ГЄГ Г¬
+        // ГЎГ»Г±ГІГ°ГҐГҐ Г±ГЄГ«Г Г¤Г»ГўГ ГІГј Г­Г®ГўГ»ГҐ ГЇГ Г°ГІГЁГЁ Гў ГЎГіГґГҐГ°.
         out.resize((size_t)B);
 
         std::lock_guard<std::mutex> lk(m);
         if (size < (size_t)B) return false;
 
-        // Используем непрерывное распределение [0.0, 1.0)
+        // Г€Г±ГЇГ®Г«ГјГ§ГіГҐГ¬ Г­ГҐГЇГ°ГҐГ°Г»ГўГ­Г®ГҐ Г°Г Г±ГЇГ°ГҐГ¤ГҐГ«ГҐГ­ГЁГҐ [0.0, 1.0)
         std::uniform_real_distribution<double> d(0.0, 1.0);
 
         auto phys = [&](size_t logical) -> size_t {
@@ -4760,13 +4792,13 @@ struct ReplayBuffer {
         for (int i = 0; i < B; ++i) {
             double u = d(rng);
 
-            // 2. Математический трюк: возводим 'u' в степень < 1.0.
-            // График функции y = x^0.75 выгибается вверх. 
-            // Это значит, что случайные значения будут чаще смещаться ближе к 1.0
-            // Логический индекс 0 — самая старая позиция, (size - 1) — самая новая.
+            // 2. ГЊГ ГІГҐГ¬Г ГІГЁГ·ГҐГ±ГЄГЁГ© ГІГ°ГѕГЄ: ГўГ®Г§ГўГ®Г¤ГЁГ¬ 'u' Гў Г±ГІГҐГЇГҐГ­Гј < 1.0.
+            // ГѓГ°Г ГґГЁГЄ ГґГіГ­ГЄГ¶ГЁГЁ y = x^0.75 ГўГ»ГЈГЁГЎГ ГҐГІГ±Гї ГўГўГҐГ°Гµ. 
+            // ГќГІГ® Г§Г­Г Г·ГЁГІ, Г·ГІГ® Г±Г«ГіГ·Г Г©Г­Г»ГҐ Г§Г­Г Г·ГҐГ­ГЁГї ГЎГіГ¤ГіГІ Г·Г Г№ГҐ Г±Г¬ГҐГ№Г ГІГјГ±Гї ГЎГ«ГЁГ¦ГҐ ГЄ 1.0
+            // Г‹Г®ГЈГЁГ·ГҐГ±ГЄГЁГ© ГЁГ­Г¤ГҐГЄГ± 0 В— Г±Г Г¬Г Гї Г±ГІГ Г°Г Гї ГЇГ®Г§ГЁГ¶ГЁГї, (size - 1) В— Г±Г Г¬Г Гї Г­Г®ГўГ Гї.
             size_t li = (size_t)(size * std::pow(u, recent_bias));
 
-            if (li >= size) li = size - 1; // Защита от выхода за пределы
+            if (li >= size) li = size - 1; // Г‡Г Г№ГЁГІГ  Г®ГІ ГўГ»ГµГ®Г¤Г  Г§Г  ГЇГ°ГҐГ¤ГҐГ«Г»
 
             out[(size_t)i] = buf[phys(li)];
         }
@@ -4780,11 +4812,11 @@ struct ReplayBuffer {
 };
 
 // ------------------------------------------------------------
-// TRT refit из libtorch модели + пересоздание Context + CUDA Graph
+// TRT refit ГЁГ§ libtorch Г¬Г®Г¤ГҐГ«ГЁ + ГЇГҐГ°ГҐГ±Г®Г§Г¤Г Г­ГЁГҐ Context + CUDA Graph
 // ------------------------------------------------------------
 
-static std::mutex g_trtMutex;     // защищаем TRT enqueue/refit/serialize
-static std::mutex g_modelMutex;   // защищаем чтение/запись весов модели и optimizer step
+static std::mutex g_trtMutex;     // Г§Г Г№ГЁГ№Г ГҐГ¬ TRT enqueue/refit/serialize
+static std::mutex g_modelMutex;   // Г§Г Г№ГЁГ№Г ГҐГ¬ Г·ГІГҐГ­ГЁГҐ/Г§Г ГЇГЁГ±Гј ГўГҐГ±Г®Гў Г¬Г®Г¤ГҐГ«ГЁ ГЁ optimizer step
 // Always lock BOTH in the same order, deadlock-free (C++17)
 static AI_FORCEINLINE std::scoped_lock<std::mutex, std::mutex> lockModelTrt() {
     return std::scoped_lock<std::mutex, std::mutex>(g_modelMutex, g_trtMutex);
@@ -4804,7 +4836,7 @@ static std::vector<float> tensorToHostVecF32(const torch::Tensor& tIn) {
     return v;
 }
 
-// Pretty-print missing refit weights (IMPORTANT: иначе refit может "молча" быть частичным).
+// Pretty-print missing refit weights (IMPORTANT: ГЁГ­Г Г·ГҐ refit Г¬Г®Г¦ГҐГІ "Г¬Г®Г«Г·Г " ГЎГ»ГІГј Г·Г Г±ГІГЁГ·Г­Г»Г¬).
 static void trtDumpMissingRefitWeights(nvinfer1::IRefitter& ref) {
     using namespace nvinfer1;
 
@@ -4895,7 +4927,7 @@ static bool trtRecreateContextAndRebindAndGraph(TrtRunner& trt) {
 // - Keep all host vectors alive until refitCudaEngine() finishes.
 // =============================================================
 
-// RAII: временно перевести модель в eval() на время refit и вернуть режим обратно.
+// RAII: ГўГ°ГҐГ¬ГҐГ­Г­Г® ГЇГҐГ°ГҐГўГҐГ±ГІГЁ Г¬Г®Г¤ГҐГ«Гј Гў eval() Г­Г  ГўГ°ГҐГ¬Гї refit ГЁ ГўГҐГ°Г­ГіГІГј Г°ГҐГ¦ГЁГ¬ Г®ГЎГ°Г ГІГ­Г®.
 struct ScopedModelEval {
     Net& model;
     bool wasTraining = false;
@@ -4915,11 +4947,11 @@ static bool trtRefitFromTorchModel(TrtRunner& trt, Net& model) {
 
     if (!trt.engine || !trt.ctx) return false;
 
-    // IMPORTANT: refit делаем из eval(), чтобы BN running stats не менялись.
+    // IMPORTANT: refit Г¤ГҐГ«Г ГҐГ¬ ГЁГ§ eval(), Г·ГІГ®ГЎГ» BN running stats Г­ГҐ Г¬ГҐГ­ГїГ«ГЁГ±Гј.
     ScopedModelEval evalGuard(model);
     torch::NoGradGuard ng;
 
-    // Если модель на CUDA — можно синхронизироваться (опционально, но безопасно).
+    // Г…Г±Г«ГЁ Г¬Г®Г¤ГҐГ«Гј Г­Г  CUDA В— Г¬Г®Г¦Г­Г® Г±ГЁГ­ГµГ°Г®Г­ГЁГ§ГЁГ°Г®ГўГ ГІГјГ±Гї (Г®ГЇГ¶ГЁГ®Г­Г Г«ГјГ­Г®, Г­Г® ГЎГҐГ§Г®ГЇГ Г±Г­Г®).
     try {
         auto params = model->parameters(); // std::vector<at::Tensor>
         if (!params.empty()) {
@@ -4933,7 +4965,7 @@ static bool trtRefitFromTorchModel(TrtRunner& trt, Net& model) {
     if (!ref) return false;
 
     // Keep host vectors alive (TensorRT reads weights during refitCudaEngine()).
-    // std::deque гарантирует стабильность адресов элементов.
+    // std::deque ГЈГ Г°Г Г­ГІГЁГ°ГіГҐГІ Г±ГІГ ГЎГЁГ«ГјГ­Г®Г±ГІГј Г Г¤Г°ГҐГ±Г®Гў ГЅГ«ГҐГ¬ГҐГ­ГІГ®Гў.
     std::deque<std::vector<float>> keep;
 
     auto pushKeep = [&](std::vector<float>&& v) -> nvinfer1::Weights {
@@ -5128,7 +5160,7 @@ static bool trtSavePlanToDisk(TrtRunner& trt, const std::string& planFile) {
 
 
 // ------------------------------------------------------------
-// Inference server для обучения (CV вместо busy-wait), + g_trtMutex
+// Inference server Г¤Г«Гї Г®ГЎГіГ·ГҐГ­ГЁГї (CV ГўГ¬ГҐГ±ГІГ® busy-wait), + g_trtMutex
 // ------------------------------------------------------------
 static std::atomic<int> g_inferInFlight{ 0 };
 
@@ -5325,7 +5357,7 @@ private:
 };
 
 // ------------------------------------------------------------
-// SearchPool: постоянные MCTS-воркеры (НЕ пересоздаём потоки на каждый search)
+// SearchPool: ГЇГ®Г±ГІГ®ГїГ­Г­Г»ГҐ MCTS-ГўГ®Г°ГЄГҐГ°Г» (ГЌГ… ГЇГҐГ°ГҐГ±Г®Г§Г¤Г ВёГ¬ ГЇГ®ГІГ®ГЄГЁ Г­Г  ГЄГ Г¦Г¤Г»Г© search)
 // ------------------------------------------------------------
 static AI_FORCEINLINE bool tryClaimSimBudget(std::atomic<int>& simsLeft) {
     int cur = simsLeft.load(std::memory_order_relaxed);
@@ -5336,7 +5368,7 @@ static AI_FORCEINLINE bool tryClaimSimBudget(std::atomic<int>& simsLeft) {
                 std::memory_order_relaxed)) {
             return true;
         }
-        // cur обновится compare_exchange_weak'ом
+        // cur Г®ГЎГ­Г®ГўГЁГІГ±Гї compare_exchange_weak'Г®Г¬
     }
     return false;
 }
@@ -5409,8 +5441,8 @@ struct SearchPool {
         }
         cv.notify_all();
 
-        // ВАЖНО: даже если TT.abort == true, мы всё равно ждём,
-        // чтобы воркеры гарантированно вышли, иначе нельзя делать T.newGame().
+        // Г‚ГЂГ†ГЌГЋ: Г¤Г Г¦ГҐ ГҐГ±Г«ГЁ TT.abort == true, Г¬Г» ГўГ±Вё Г°Г ГўГ­Г® Г¦Г¤ВёГ¬,
+        // Г·ГІГ®ГЎГ» ГўГ®Г°ГЄГҐГ°Г» ГЈГ Г°Г Г­ГІГЁГ°Г®ГўГ Г­Г­Г® ГўГ»ГёГ«ГЁ, ГЁГ­Г Г·ГҐ Г­ГҐГ«ГјГ§Гї Г¤ГҐГ«Г ГІГј T.newGame().
         const auto t0 = std::chrono::steady_clock::now();
         const auto hardTimeout = std::chrono::seconds(2);
 
@@ -5418,13 +5450,13 @@ struct SearchPool {
             if (workersBusy.load(std::memory_order_relaxed) == 0) break;
 
             if (TT.abort.load(std::memory_order_relaxed)) {
-                // ускоряем останов
+                // ГіГ±ГЄГ®Г°ГїГҐГ¬ Г®Г±ГІГ Г­Г®Гў
                 cancelJob.store(true, std::memory_order_relaxed);
                 simsLeft.store(0, std::memory_order_relaxed);
             }
 
             if (std::chrono::steady_clock::now() - t0 > hardTimeout) {
-                // Если реально зависли — лучше остановить пул, чем продолжать с битым состоянием.
+                // Г…Г±Г«ГЁ Г°ГҐГ Г«ГјГ­Г® Г§Г ГўГЁГ±Г«ГЁ В— Г«ГіГ·ГёГҐ Г®Г±ГІГ Г­Г®ГўГЁГІГј ГЇГіГ«, Г·ГҐГ¬ ГЇГ°Г®Г¤Г®Г«Г¦Г ГІГј Г± ГЎГЁГІГ»Г¬ Г±Г®Г±ГІГ®ГїГ­ГЁГҐГ¬.
                 std::cerr << "[SearchPool] ERROR: workers did not stop in time. Forcing shutdown.\n";
                 shutdown();
                 break;
@@ -5513,7 +5545,7 @@ for (;;) {
 
 // ------------------------------------------------------------
 // Search fixed number of simulations (sims) with tree reuse
-// Dirichlet noise применяется ТОЛЬКО временно на root (не портит priors в TT навсегда)
+// Dirichlet noise ГЇГ°ГЁГ¬ГҐГ­ГїГҐГІГ±Гї Г’ГЋГ‹ГњГЉГЋ ГўГ°ГҐГ¬ГҐГ­Г­Г® Г­Г  root (Г­ГҐ ГЇГ®Г°ГІГЁГІ priors Гў TT Г­Г ГўГ±ГҐГЈГ¤Г )
 // ------------------------------------------------------------
 
 // Expand root (or any node keyed by rootPos) exactly once for training-selfplay.
@@ -5679,7 +5711,7 @@ static int pickMoveFromVisits(const std::vector<moveState>& mv, float temperatur
     return mv.back().move;
 }
 
-// policy target — SPARSE (idx/prob), idx в CHW: k=pl*64+sq
+// policy target В— SPARSE (idx/prob), idx Гў CHW: k=pl*64+sq
 static void buildSparsePolicyTargetCHW(const Position& pos,
     const std::vector<moveState>& mv,
     uint16_t& outN,
@@ -5714,7 +5746,7 @@ static void buildSparsePolicyTargetCHW(const Position& pos,
     }
 }
 
-// временно (на один search) зашумливаем root priors и потом откатываем назад
+// ГўГ°ГҐГ¬ГҐГ­Г­Г® (Г­Г  Г®Г¤ГЁГ­ search) Г§Г ГёГіГ¬Г«ГЁГўГ ГҐГ¬ root priors ГЁ ГЇГ®ГІГ®Г¬ Г®ГІГЄГ ГІГ»ГўГ ГҐГ¬ Г­Г Г§Г Г¤
 static void runFixedSims(MCTSTable& T,
     SearchPool& pool,
     InferenceServerTrain& srv,
@@ -5732,8 +5764,8 @@ static void runFixedSims(MCTSTable& T,
     TTEdge* e0 = nullptr;
     int nEdges = 0;
 
-    // Сохраняем root priors в сыром квантованном виде, чтобы потом
-    // восстановить их без лишней ошибки округления.
+    // Г‘Г®ГµГ°Г Г­ГїГҐГ¬ root priors Гў Г±Г»Г°Г®Г¬ ГЄГўГ Г­ГІГ®ГўГ Г­Г­Г®Г¬ ГўГЁГ¤ГҐ, Г·ГІГ®ГЎГ» ГЇГ®ГІГ®Г¬
+    // ГўГ®Г±Г±ГІГ Г­Г®ГўГЁГІГј ГЁГµ ГЎГҐГ§ Г«ГЁГёГ­ГҐГ© Г®ГёГЁГЎГЄГЁ Г®ГЄГ°ГіГЈГ«ГҐГ­ГЁГї.
     std::vector<uint16_t> savedPriorQ;
 
     if (rootNoise &&
@@ -5762,7 +5794,7 @@ static void runFixedSims(MCTSTable& T,
 
     srv.waitIdle();
 
-    // Восстанавливаем исходные root priors.
+    // Г‚Г®Г±Г±ГІГ Г­Г ГўГ«ГЁГўГ ГҐГ¬ ГЁГ±ГµГ®Г¤Г­Г»ГҐ root priors.
     if (!savedPriorQ.empty() && e0 && nEdges > 0) {
         for (int i = 0; i < nEdges; ++i) {
             e0[i].setPriorRaw(savedPriorQ[(size_t)i]);
@@ -5771,7 +5803,7 @@ static void runFixedSims(MCTSTable& T,
 }
 
 // ------------------------------------------------------------
-// Self-play: переиспользуем один MCTSTable + один InferenceServerTrain + SearchPool
+// Self-play: ГЇГҐГ°ГҐГЁГ±ГЇГ®Г«ГјГ§ГіГҐГ¬ Г®Г¤ГЁГ­ MCTSTable + Г®Г¤ГЁГ­ InferenceServerTrain + SearchPool
 // ------------------------------------------------------------
 
 static AI_FORCEINLINE void resetMCTSTableForNewGame(MCTSTable& T) {
@@ -5881,7 +5913,7 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
 
     float zWhite = 0.5f;
     if (outTerminated) {
-        // term означает "у side-to-move есть немедленная победа (взятие короля)".
+        // term Г®Г§Г­Г Г·Г ГҐГІ "Гі side-to-move ГҐГ±ГІГј Г­ГҐГ¬ГҐГ¤Г«ГҐГ­Г­Г Гї ГЇГ®ГЎГҐГ¤Г  (ГўГ§ГїГІГЁГҐ ГЄГ®Г°Г®Г«Гї)".
         // winner = side-to-move => whiteWin = 1 - pos.side
         zWhite = 1.0f - pos.side;
     }
@@ -5896,7 +5928,7 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
 }
 
 // ------------------------------------------------------------
-// Trainer thread: sparse policy loss через gather(logp, idx)
+// Trainer thread: sparse policy loss Г·ГҐГ°ГҐГ§ gather(logp, idx)
 // + pin_memory/non_blocking, + grad clipping, + NaN guard
 // ------------------------------------------------------------
 
@@ -5940,8 +5972,8 @@ double   warmupStartFactor = 0.10;         // 0.05..0.25 usually good
     // State
     uint64_t steps = 0;
     float lastLoss = 0.0f;
-    float lastLossP = 0.0f; // <--- ДОБАВИТЬ ЭТО
-    float lastLossV = 0.0f; // <--- ДОБАВИТЬ ЭТО
+    float lastLossP = 0.0f; // <--- Г„ГЋГЃГЂГ‚Г€Г’Гњ ГќГ’ГЋ
+    float lastLossV = 0.0f; // <--- Г„ГЋГЃГЂГ‚Г€Г’Гњ ГќГ’ГЋ
 double computeBaseLRFromSteps(uint64_t s) const {
     double lr = initial_lr;
     for (uint64_t ms : lr_milestones) {
@@ -6092,8 +6124,8 @@ updateLR(true);
             }
 
             float lossScalar = 0.0f;
-            float lossPScalar = 0.0f; // <--- ДОБАВИТЬ
-            float lossVScalar = 0.0f; // <--- ДОБАВИТЬ
+            float lossPScalar = 0.0f; // <--- Г„ГЋГЃГЂГ‚Г€Г’Гњ
+            float lossVScalar = 0.0f; // <--- Г„ГЋГЃГЂГ‚Г€Г’Гњ
             bool didStep = false;
 
             {
@@ -6118,8 +6150,8 @@ updateLR(true);
                     opt->step();
 
                     lossScalar = loss.item<float>();
-                    lossPScalar = lossP.item<float>(); // <--- СОХРАНЯЕМ lossP
-                    lossVScalar = lossV.item<float>(); // <--- СОХРАНЯЕМ lossV
+                    lossPScalar = lossP.item<float>(); // <--- Г‘ГЋГ•ГђГЂГЌГџГ…ГЊ lossP
+                    lossVScalar = lossV.item<float>(); // <--- Г‘ГЋГ•ГђГЂГЌГџГ…ГЊ lossV
                     didStep = true;
                 }
             }
@@ -6129,8 +6161,8 @@ updateLR(true);
             ++done;
             ++steps;
             lastLoss = lossScalar;
-            lastLossP = lossPScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
-            lastLossV = lossVScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
+            lastLossP = lossPScalar; // <--- ГЋГЃГЌГЋГ‚Г‹ГџГ…ГЊ STATE Г’ГђГ…ГЌГ…ГђГЂ
+            lastLossV = lossVScalar; // <--- ГЋГЃГЌГЋГ‚Г‹ГџГ…ГЊ STATE Г’ГђГ…ГЌГ…ГђГЂ
             updateLR();
         }
 
@@ -6322,21 +6354,21 @@ static void initAllOrExit(Net& model,
     else          initSlidersMagics();
 
     if (!loadOrCreateTorchModel(ptFile, model)) {
-        std::cerr << "Не удалось загрузить/создать " << ptFile << "\n";
+        std::cerr << "ГЌГҐ ГіГ¤Г Г«Г®Г±Гј Г§Г ГЈГ°ГіГ§ГЁГІГј/Г±Г®Г§Г¤Г ГІГј " << ptFile << "\n";
         std::exit(1);
     }
 
     {
         std::lock_guard<std::mutex> lk(g_trtMutex);
         if (!g_trt.initOrCreate(planFile)) {
-            std::cerr << "TensorRT: не удалось инициализировать движок.\n";
+            std::cerr << "TensorRT: Г­ГҐ ГіГ¤Г Г«Г®Г±Гј ГЁГ­ГЁГ¶ГЁГ Г«ГЁГ§ГЁГ°Г®ГўГ ГІГј Г¤ГўГЁГ¦Г®ГЄ.\n";
             std::exit(1);
         }
         g_trtReady = true;
         g_nnBatch = TRT_MAX_BATCH;
     }
 
-    // Первичный refit
+    // ГЏГҐГ°ГўГЁГ·Г­Г»Г© refit
     {
         std::scoped_lock lk(g_modelMutex, g_trtMutex);
         torch::NoGradGuard ng;
@@ -6386,9 +6418,145 @@ static void saveAll(const std::string& ptFile,
 // ------------------------------------------------------------
 
 static void safeRefitBarrier(SelfPlayContext& sp) {
-    // Гарантируем, что на момент refit:
+static int pickMoveFromPolicySimulations(Net& model,
+    const Position& pos,
+    const std::array<int, 64>& mask,
+    const MoveList& ml,
+    int simulations) {
+    if (ml.n <= 0) return 0;
+
+    std::array<float, NN_INPUT_SIZE> x{};
+    positionToNNInput(pos, x);
+
+    auto in = torch::from_blob(x.data(), { 1, NN_SQ_PLANES, 8, 8 }, torch::kFloat32).clone();
+    if (model->parameters().size() > 0) {
+        auto dev = model->parameters().front().device();
+        in = in.to(dev);
+    }
+
+    torch::NoGradGuard ng;
+    auto out = model->forward(in);
+    auto logits = out.first.view({ POLICY_SIZE }).to(torch::kCPU);
+
+    std::vector<int> legalIdx;
+    legalIdx.reserve((size_t)ml.n);
+    for (int i = 0; i < ml.n; ++i) {
+        int idx = policyIndexCHWCanonical(ml.m[i], pos.side, mask);
+        if (idx < 0 || idx >= POLICY_SIZE) idx = 0;
+        legalIdx.push_back(idx);
+    }
+
+    auto idxTensor = torch::tensor(legalIdx, torch::TensorOptions().dtype(torch::kInt64));
+    auto legalLogits = logits.index_select(0, idxTensor);
+    auto probs = torch::softmax(legalLogits, 0).to(torch::kFloat32).contiguous();
+
+    std::vector<float> prob((size_t)ml.n, 0.0f);
+    std::memcpy(prob.data(), probs.data_ptr<float>(), sizeof(float) * (size_t)ml.n);
+
+    std::discrete_distribution<int> pick(prob.begin(), prob.end());
+    std::vector<int> visits((size_t)ml.n, 0);
+    simulations = std::max(1, simulations);
+    for (int i = 0; i < simulations; ++i) {
+        int k = pick(Random);
+        if (k >= 0 && k < ml.n) ++visits[(size_t)k];
+    }
+
+    int best = 0;
+    for (int i = 1; i < ml.n; ++i) {
+        if (visits[(size_t)i] > visits[(size_t)best]) best = i;
+    }
+    return ml.m[best];
+}
+
+static float playArenaGamePolicySim(Net& currentModel,
+    Net& oldModel,
+    bool currentIsWhite,
+    int simulationsPerMove,
+    int maxPlies) {
+    Position pos;
+    std::array<uint64_t, 4> path;
+    std::array<int, 64> mask;
+    chess960(pos, path, mask);
+
+    MoveList ml;
+    int term = 0;
+
+    for (int ply = 0; ply < maxPlies; ++ply) {
+        genLegal(pos, path, mask, ml, term);
+        if (term) {
+            float zWhite = 1.0f - pos.side;
+            if (currentIsWhite) return zWhite;
+            return 1.0f - zWhite;
+        }
+
+        if (ml.n == 0) {
+            makeRandom(pos, nullptr);
+            continue;
+        }
+
+        bool currentTurn = (pos.side == 0) ? currentIsWhite : (!currentIsWhite);
+        Net& actor = currentTurn ? currentModel : oldModel;
+        int mv = pickMoveFromPolicySimulations(actor, pos, mask, ml, simulationsPerMove);
+        if (!mv) return 0.5f;
+        makeMove(pos, mask, mv);
+    }
+
+    return 0.5f;
+}
+
+static void runArenaMatchPolicySim(Net& model,
+    const ModelSnapshot& oldSnapshot,
+    int games,
+    int simulationsPerMove) {
+    if (games <= 0) return;
+
+    Net oldModel;
+    oldModel->to(torch::kCPU);
+    loadModelSnapshot(oldModel, oldSnapshot);
+
+    bool wasTraining = model->is_training();
+    model->eval();
+    oldModel->eval();
+
+    float score = 0.0f;
+    int wins = 0, losses = 0, draws = 0;
+
+    for (int g = 0; g < games; ++g) {
+        bool currentIsWhite = ((g & 1) == 0);
+        float s = playArenaGamePolicySim(model, oldModel, currentIsWhite, simulationsPerMove, 256);
+        score += s;
+        if (s > 0.75f) ++wins;
+        else if (s < 0.25f) ++losses;
+        else ++draws;
+    }
+
+    std::cerr << "[arena] current vs old: games=" << games
+        << " sims=" << simulationsPerMove
+        << " score=" << score
+        << " winrate=" << (score / (float)games)
+        << " (W/D/L=" << wins << "/" << draws << "/" << losses << ")\n";
+
+    if (wasTraining) model->train();
+}
+
+    ModelSnapshot oldModelSnapshot = captureModelSnapshot(model);
+
+    static constexpr int MATCH_EVERY_GAMES = 10000;
+    static constexpr int MATCH_GAMES = 1000;
+    static constexpr int MATCH_SIMS_PER_MOVE = 200;
+
+    int nextMatchAt = MATCH_EVERY_GAMES;
+
+
+            if (games >= nextMatchAt) {
+                safeRefitBarrier(sp);
+                runArenaMatchPolicySim(model, oldModelSnapshot, MATCH_GAMES, MATCH_SIMS_PER_MOVE);
+                oldModelSnapshot = captureModelSnapshot(model);
+                nextMatchAt += MATCH_EVERY_GAMES;
+            }
+    // ГѓГ Г°Г Г­ГІГЁГ°ГіГҐГ¬, Г·ГІГ® Г­Г  Г¬Г®Г¬ГҐГ­ГІ refit:
     // - server idle
-    // - очередь пуста
+    // - Г®Г·ГҐГ°ГҐГ¤Гј ГЇГіГ±ГІГ 
     sp.server.waitIdle();
     sp.server.clearQueueUnsafeWhenIdle();
 }
@@ -6408,7 +6576,7 @@ void Training(int targetGames) {
     static constexpr size_t REPLAY_CAP = 1000000;
     ReplayBuffer rb(REPLAY_CAP);
 
-    // Trainer: сначала восстановим steps, потом init(), потом optimizer
+    // Trainer: Г±Г­Г Г·Г Г«Г  ГўГ®Г±Г±ГІГ Г­Г®ГўГЁГ¬ steps, ГЇГ®ГІГ®Г¬ init(), ГЇГ®ГІГ®Г¬ optimizer
     Trainer trainer;
 
     if (loadTrainerState(trainerStateFile, trainer)) {
@@ -6423,7 +6591,7 @@ void Training(int targetGames) {
     if (loadOptimizerState(optFile, trainer)) {
         std::cerr << "[Trainer] optimizer state restored.\n";
 
-        // После restore optimizer ещё раз принудительно выставим LR по scheduler'у
+        // ГЏГ®Г±Г«ГҐ restore optimizer ГҐГ№Вё Г°Г Г§ ГЇГ°ГЁГ­ГіГ¤ГЁГІГҐГ«ГјГ­Г® ГўГ»Г±ГІГ ГўГЁГ¬ LR ГЇГ® scheduler'Гі
         trainer.current_lr = -1.0;
         trainer.updateLR(true);
     }
@@ -6465,7 +6633,7 @@ void Training(int targetGames) {
     int trainBlocks = 0;
     int refits = 0;
 
-    std::cout << "Начинаем тренировку на " << targetGames << " партий...\n";
+    std::cout << "ГЌГ Г·ГЁГ­Г ГҐГ¬ ГІГ°ГҐГ­ГЁГ°Г®ГўГЄГі Г­Г  " << targetGames << " ГЇГ Г°ГІГЁГ©...\n";
 
     while (games < targetGames) {
         // ===========================
@@ -6540,7 +6708,7 @@ void Training(int targetGames) {
 
             saveAll(ptFile, planFile, optFile, trainerStateFile, model, trainer);
 
-            std::cout << "[autosave] Прогресс: " << games << " / " << targetGames << " партий.\n";
+            std::cout << "[autosave] ГЏГ°Г®ГЈГ°ГҐГ±Г±: " << games << " / " << targetGames << " ГЇГ Г°ГІГЁГ©.\n";
         }
 
         if (now >= nextStat) {
@@ -6563,7 +6731,7 @@ void Training(int targetGames) {
     safeRefitBarrier(sp);
     sp.stop();
 
-    std::cout << "\n[Завершение] Собрано " << targetGames << " партий. Сохранение финальных весов...\n";
+    std::cout << "\n[Г‡Г ГўГҐГ°ГёГҐГ­ГЁГҐ] Г‘Г®ГЎГ°Г Г­Г® " << targetGames << " ГЇГ Г°ГІГЁГ©. Г‘Г®ГµГ°Г Г­ГҐГ­ГЁГҐ ГґГЁГ­Г Г«ГјГ­Г»Гµ ГўГҐГ±Г®Гў...\n";
     {
         std::lock_guard<std::mutex> lk(g_modelMutex);
 
@@ -6583,7 +6751,7 @@ void Training(int targetGames) {
         }
     }
 
-    std::cout << "[Завершение] Запуск финальной пересборки TensorRT (Rebuild). Это займет пару минут...\n";
+    std::cout << "[Г‡Г ГўГҐГ°ГёГҐГ­ГЁГҐ] Г‡Г ГЇГіГ±ГЄ ГґГЁГ­Г Г«ГјГ­Г®Г© ГЇГҐГ°ГҐГ±ГЎГ®Г°ГЄГЁ TensorRT (Rebuild). ГќГІГ® Г§Г Г©Г¬ГҐГІ ГЇГ Г°Гі Г¬ГЁГ­ГіГІ...\n";
 
     // 1) shutdown + remove old plan
     {
@@ -6601,7 +6769,7 @@ void Training(int targetGames) {
     }
 
     if (!okInit) {
-        std::cerr << "[Завершение] FATAL ERROR: Не удалось пересобрать финальный net.plan!\n";
+        std::cerr << "[Г‡Г ГўГҐГ°ГёГҐГ­ГЁГҐ] FATAL ERROR: ГЌГҐ ГіГ¤Г Г«Г®Г±Гј ГЇГҐГ°ГҐГ±Г®ГЎГ°Г ГІГј ГґГЁГ­Г Г«ГјГ­Г»Г© net.plan!\n";
     }
     else {
         // 3) refit from final torch model and save final plan
@@ -6622,7 +6790,7 @@ void Training(int targetGames) {
         }
     }
 
-    std::cout << "Тренировка успешно завершена! Файлы net.pt, optimizer.pt, trainer_state.bin и net.plan готовы.\n";
+    std::cout << "Г’Г°ГҐГ­ГЁГ°Г®ГўГЄГ  ГіГ±ГЇГҐГёГ­Г® Г§Г ГўГҐГ°ГёГҐГ­Г ! Г”Г Г©Г«Г» net.pt, optimizer.pt, trainer_state.bin ГЁ net.plan ГЈГ®ГІГ®ГўГ».\n";
 }
 
 
@@ -6631,7 +6799,7 @@ int main() {
     const std::string ptFile = "net.pt";
     const std::string planFile = "net.plan";
 
-    std::cout << "Введите FEN (или '960' для случайной Chess960 позиции, '-' для Training):\n";
+    std::cout << "Г‚ГўГҐГ¤ГЁГІГҐ FEN (ГЁГ«ГЁ '960' Г¤Г«Гї Г±Г«ГіГ·Г Г©Г­Г®Г© Chess960 ГЇГ®Г§ГЁГ¶ГЁГЁ, '-' Г¤Г«Гї Training):\n";
     std::string fen;
     std::getline(std::cin, fen);
 
@@ -6646,7 +6814,7 @@ int main() {
     Net model;
     initAllOrExit(model, ptFile, planFile);
     if (!g_trtReady) {
-        std::cout << "TensorRT движок не загружен.\n";
+        std::cout << "TensorRT Г¤ГўГЁГ¦Г®ГЄ Г­ГҐ Г§Г ГЈГ°ГіГ¦ГҐГ­.\n";
         return 1;
     }
 
