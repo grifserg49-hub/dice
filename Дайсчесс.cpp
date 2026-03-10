@@ -1894,7 +1894,7 @@ void makeRandom(Position& pos,TTNode* node) {
     uint64_t pawns = pos.color[pos.side] & pos.piece[0];
     int dist = 6;
     pos.key ^= ZDice[pos.dice];
-    pos.dice = Dice[(pos.key+visits)%216];
+pos.dice = Dice[Range(Random)];
     if (pawns) {
         if (pos.side == 0)dist = clz64(pawns) >> 3;   // MSVC-safe
         else dist = ctz64(pawns) >> 3;            // MSVC-safe
@@ -1988,10 +1988,10 @@ static constexpr int POLICY_P = 73;
 static constexpr float BN_EPS = 1e-5f;
 
 // SE (affine)
-static constexpr int SE_CHANNELS = 16;   // äëÿ C=128 îáû÷íî 8..16; 16 ñèëüíåå
+static constexpr int SE_CHANNELS = 16;   // для C=128 обычно 8..16; 16 сильнее
 
 // Heads
-static constexpr int HEAD_POLICY_C = 32; // 32 äëÿ 10x128  ñòàíäàðòíûé õîðîøèé âûáîð
+static constexpr int HEAD_POLICY_C = 32; // 32 для 10x128 — стандартный хороший выбор
 static constexpr int HEAD_VALUE_C = 32;
 static constexpr int HEAD_VALUE_FC = 256;
 static constexpr int POLICY_SIZE = 8 * 8 * POLICY_P; // 4672
@@ -2855,7 +2855,7 @@ struct TrtRunner {
                 total,
                 stream);
 
-            // ïî æåëàíèþ íà âðåìÿ îòëàäêè:
+            // по желанию на время отладки:
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -2971,15 +2971,15 @@ struct TrtRunner {
             shutdown();
         }
 
-        std::cout << "Ôàéë TensorRT ïëàíà '" << planFile << "' íå íàéäåí/íå ãðóçèòñÿ  ñîáèðàþ äâèæîê...\n";
+        std::cout << "Файл TensorRT плана '" << planFile << "' не найден/не грузится — собираю движок...\n";
         if (!buildAndSavePlan(planFile)) {
-            std::cerr << "Íå óäàëîñü ñîáðàòü è ñîõðàíèòü TensorRT plan '" << planFile << "'.\n";
+            std::cerr << "Не удалось собрать и сохранить TensorRT plan '" << planFile << "'.\n";
             return false;
         }
-        std::cout << "Ñîáðàí è ñîõðàí¸í '" << planFile << "'. Çàãðóæàþ...\n";
+        std::cout << "Собран и сохранён '" << planFile << "'. Загружаю...\n";
 
         if (!initFromPlan(planFile)) {
-            std::cerr << "Íå óäàëîñü çàãðóçèòü TensorRT plan ïîñëå ñáîðêè.\n";
+            std::cerr << "Не удалось загрузить TensorRT plan после сборки.\n";
             shutdown();
             return false;
         }
@@ -3059,7 +3059,7 @@ struct TrtRunner {
                 total,
                 stream);
 
-            // ïî æåëàíèþ íà âðåìÿ îòëàäêè:
+            // по желанию на время отладки:
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -3159,20 +3159,20 @@ static AI_FORCEINLINE void cpuRelax() {
 // -------------------------------
 // Time-based backoff wait helpers
 // -------------------------------
-static constexpr int64_t AI_LOCK_WAIT_US = 2000;   // 2ms (êàê áûëî)
+static constexpr int64_t AI_LOCK_WAIT_US = 2000;   // 2ms (как было)
 static constexpr int64_t AI_EXPAND_WAIT_US = 100000;
 
 static AI_FORCEINLINE void backoffWait(int& spins) {
     cpuRelax();
     ++spins;
 
-    // ÂÀÆÍÎ: íèêàêèõ sleep_for(microseconds)  íà ìíîãèõ ÎÑ ýòî âûðîæäàåòñÿ â ~1ms.
-    // Yield äåëàåì ðåäêî, ÷òîáû íå òåðÿòü throughput.
+    // ВАЖНО: никаких sleep_for(microseconds) — на многих ОС это вырождается в ~1ms.
+    // Yield делаем редко, чтобы не терять throughput.
     if (spins == 256 || spins == 1024 || spins == 4096) {
         std::this_thread::yield();
     }
     if (spins > 16384) {
-        // åñëè î÷åíü äîëãî  íà÷èíàåì yield ÷àùå, íî âñ¸ ðàâíî áåç ñíà
+        // если очень долго — начинаем yield чаще, но всё равно без сна
         std::this_thread::yield();
     }
 }
@@ -3320,9 +3320,6 @@ struct MCTSTable {
 
         int probe = 0;
         int lockSpins = 0;
-        using Clock = std::chrono::steady_clock;
-        Clock::time_point lockStart = Clock::time_point{};
-        uint64_t lockStartIdx = ~0ull;
 
         while (probe < PROBE_LIMIT) {
             MCTSSlot& s = slots[(size_t)idx];
@@ -3366,21 +3363,25 @@ struct MCTSTable {
             }
 
             if (mt == TAG_LOCKED32) {
-                // ôèêñèðóåì "íà÷àëî îæèäàíèÿ" äëÿ êîíêðåòíîãî ñëîòà idx
+                using Clock = std::chrono::steady_clock;
+                Clock::time_point lockStart = Clock::time_point{};
+                uint64_t lockStartIdx = ~0ull;
+
+                // фиксируем "начало ожидания" для конкретного слота idx
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
                     lockStart = Clock::now();
                     lockSpins = 0;
                 }
 
-                // æä¸ì, íî îãðàíè÷åííî ïî âðåìåíè
+                // ждём, но ограниченно по времени
                 if (Clock::now() - lockStart > std::chrono::microseconds(AI_LOCK_WAIT_US)) {
-                    // ÍÈÊÀÊÎÃÎ abort: ïðîñòî ñäà¸ìñÿ íà ýòó ïîïûòêó (ñèìóëÿöèÿ ìîæåò ïîâòîðèòüñÿ)
+                    // НИКАКОГО abort: просто сдаёмся на эту попытку (симуляция может повториться)
                     return nullptr;
                 }
 
                 backoffWait(lockSpins);
-                continue; // IMPORTANT: íå äâèãàåì idx è íå óâåëè÷èâàåì probe
+                continue; // IMPORTANT: не двигаем idx и не увеличиваем probe
             }
             lockSpins = 0;
 
@@ -3481,7 +3482,7 @@ static AI_FORCEINLINE float edgeQ(const TTEdge& e) {
     return clamp01((float)(e.sum() / (double)v));
 }
 
-// Âûáîð PV: ñíà÷àëà max visits, çàòåì max Q, çàòåì max prior.
+// Выбор PV: сначала max visits, затем max Q, затем max prior.
 static AI_FORCEINLINE int selectBestPVEdge(const TTNode& n, const TTEdge* e0) {
     int bestI = 0;
     uint32_t bestV = 0;
@@ -3506,7 +3507,7 @@ static AI_FORCEINLINE int selectBestPVEdge(const TTNode& n, const TTEdge* e0) {
     return bestI;
 }
 
-// Ïåðåâîä "value äëÿ side-to-move" -> "value äëÿ áåëûõ"
+// Перевод "value для side-to-move" -> "value для белых"
 static AI_FORCEINLINE float toWhitePerspective(float qSideToMove, int sideToMove) {
     // sideToMove: 0=white, 1=black
     return (sideToMove == 0) ? qSideToMove : (1.0f - qSideToMove);
@@ -3524,31 +3525,31 @@ static float evalOnePVNoExpandWhite(MCTSTable& T,
 
         uint8_t ex = n->expanded.load(std::memory_order_acquire);
         if (ex != 1) {
-            // Íå æä¸ì, íå ðàñøèðÿåì  ïðîñòî èñïîëüçóåì òî, ÷òî åñòü.
+            // Не ждём, не расширяем — просто используем то, что есть.
             float q = nodeQ(*n);
             return toWhitePerspective(q, pos.side);
         }
 
         if (n->terminal) {
-            // Â òâîåé ëîãèêå terminal áýêàïèòñÿ êàê v=1.0 (âûèãðûø side-to-move).
+            // В твоей логике terminal бэкапится как v=1.0 (выигрыш side-to-move).
             float q = 1.0f;
             return toWhitePerspective(q, pos.side);
         }
 
         if (n->edgeCount == 0) {
             if (n->chance) {
-                // Chance-óçåë: êèäàåì "êîñòè" êàê â îñíîâíîì äåðåâå.
+                // Chance-узел: кидаем "кости" как в основном дереве.
                 makeRandom(pos,n);
                 continue;
             }
             else {
-                // Óçåë áåç õîäîâ, íî íå chance: áåð¸ì ñðåäíèé Q óçëà.
+                // Узел без ходов, но не chance: берём средний Q узла.
                 float q = nodeQ(*n);
                 return toWhitePerspective(q, pos.side);
             }
         }
 
-        // Decision-óçåë: èä¸ì ïî PV
+        // Decision-узел: идём по PV
         TTEdge* e0 = T.edgePtr(n->edgeBegin);
         int bi = selectBestPVEdge(*n, e0);
         int m = e0[bi].move;
@@ -3556,7 +3557,7 @@ static float evalOnePVNoExpandWhite(MCTSTable& T,
         makeMove(pos, mask, m);
     }
 
-    // Åñëè óï¸ðëèñü â maxDepth  îöåíèì òåêóùèé óçåë êàê åñòü
+    // Если упёрлись в maxDepth — оценим текущий узел как есть
     TTNode* n = T.findNodeNoInsert(pos.key);
     if (!n) return 0.5f;
     float q = nodeQ(*n);
@@ -3626,9 +3627,9 @@ static AI_FORCEINLINE int selectPUCT(const TTNode& n,
 static constexpr int MCTS_MAX_DEPTH = 256;
 
 // Classic virtual loss
-static constexpr uint32_t VLOSS_N = 1;     // îáû÷íî 1; 2-3 èìååò ñìûñë òîëüêî ïðè î÷åíü ìíîãèõ ïîòîêàõ
-static constexpr float    VLOSS_VALUE = 0.0f; // value â øêàëå [0..1]; 0.0 = "loss for side-to-move"
-static constexpr bool     VLOSS_BUMP_NODE_VISITS = false; // îïöèîíàëüíî
+static constexpr uint32_t VLOSS_N = 1;     // обычно 1; 2-3 имеет смысл только при очень многих потоках
+static constexpr float    VLOSS_VALUE = 0.0f; // value в шкале [0..1]; 0.0 = "loss for side-to-move"
+static constexpr bool     VLOSS_BUMP_NODE_VISITS = false; // опционально
 
 struct TraceStep {
     TTNode* node = nullptr;
@@ -3667,16 +3668,16 @@ static AI_FORCEINLINE void applyVirtualLoss(TraceStep& s) {
 
     if (VLOSS_BUMP_NODE_VISITS && s.node) {
         s.node->visits.fetch_add(VLOSS_N, std::memory_order_relaxed);
-        // valueSum óçëà ÍÅ òðîãàåì (êëàññèêà)
+        // valueSum узла НЕ трогаем (классика)
     }
 
     if (s.edge) {
         s.edge->visits.fetch_add(VLOSS_N, std::memory_order_relaxed);
-        // loss â [0..1] øêàëå => äîáàâëÿåì W êàê áóäòî âåðíóëñÿ VLOSS_VALUE
+        // “loss” в [0..1] шкале => добавляем W как будто вернулся VLOSS_VALUE
         if (VLOSS_VALUE != 0.0f) {
             atomicAddDouble(s.edge->valueSum, (double)VLOSS_VALUE * (double)VLOSS_N);
         }
-        // åñëè VLOSS_VALUE=0.0f, valueSum ìîæíî íå òðîãàòü âîîáùå
+        // если VLOSS_VALUE=0.0f, valueSum можно не трогать вообще
     }
 }
 
@@ -4476,7 +4477,7 @@ void mctsBatchedMT(Position& rootPos,
                 int qs = nnServer.size();
                 throttleOnNNQueue_NoSleep(qs, throttleSpins);
 
-                // åñëè î÷åðåäü ñîâñåì îãðîìíàÿ  íå ãåíåðèì íîâûå leaf'û ïðÿìî ñåé÷àñ
+                // если очередь совсем огромная — не генерим новые leaf'ы прямо сейчас
                 if (qs > 2000) continue;
                 bool ok = runOneSim(T, rootPos, path, mask, rootNoise,
                     p, needNN,
@@ -4490,7 +4491,7 @@ void mctsBatchedMT(Position& rootPos,
                 simOK.fetch_add(1, std::memory_order_relaxed);
                 if (needNN) {
                     nnExp.fetch_add(1, std::memory_order_relaxed);
-                    nnServer.submit(std::move(p));   // ñðàçó îòïðàâèëè => expanded=2 áóäåò íåäîëãî
+                    nnServer.submit(std::move(p));   // сразу отправили => expanded=2 будет недолго
                 }
             }
 
@@ -4554,10 +4555,10 @@ void mctsBatchedMT(Position& rootPos,
 }
 
 // ===================== TRAINING PATCH BEGIN (FINAL) =====================
-// (ïðîäîëæåíèå áóäåò â ñîîáùåíèè 2/2)
+// (продолжение будет в сообщении 2/2)
 // ===================== TRAINING PATCH BEGIN (FINAL) =====================
-// ÂÑÒÀÂÜ ÝÒÎ ÂÌÅÑÒÎ ÒÂÎÅÃÎ ÒÅÊÓÙÅÃÎ `static void init()` È `int main()`
-// (ò.å. óäàëèòü/çàìåíèòü âñ¸ îò `static void init()` äî êîíöà ôàéëà).
+// ВСТАВЬ ЭТО ВМЕСТО ТВОЕГО ТЕКУЩЕГО `static void init()` И `int main()`
+// (т.е. удалить/заменить всё от `static void init()` до конца файла).
 
 
 
@@ -4685,8 +4686,9 @@ struct NetImpl final : torch::nn::Module {
         v = v.contiguous().view({ v.size(0), HEAD_VALUE_C * 64 });
         v = torch::relu(valFC1->forward(v));
 
-        // Ïîëó÷àåì ñûðûå ëîãèòû
+        // Получаем сырые логиты
         v = valFC2->forward(v);
+
 
         if (!is_training()) {
             v = torch::sigmoid(v);
@@ -4696,38 +4698,6 @@ struct NetImpl final : torch::nn::Module {
     }
 };
 TORCH_MODULE(Net);
-
-struct ModelSnapshot {
-    std::unordered_map<std::string, torch::Tensor> params;
-    std::unordered_map<std::string, torch::Tensor> buffers;
-};
-
-static ModelSnapshot captureModelSnapshot(const Net& model) {
-    ModelSnapshot snap;
-    for (const auto& p : model->named_parameters(/*recurse=*/true)) {
-        snap.params[p.key()] = p.value().detach().cpu().clone();
-    }
-    for (const auto& b : model->named_buffers(/*recurse=*/true)) {
-        snap.buffers[b.key()] = b.value().detach().cpu().clone();
-    }
-    return snap;
-}
-
-static void loadModelSnapshot(Net& model, const ModelSnapshot& snap) {
-    torch::NoGradGuard ng;
-    for (auto& p : model->named_parameters(/*recurse=*/true)) {
-        auto it = snap.params.find(p.key());
-        if (it != snap.params.end()) {
-            p.value().copy_(it->second.to(p.value().device(), p.value().scalar_type()));
-        }
-    }
-    for (auto& b : model->named_buffers(/*recurse=*/true)) {
-        auto it = snap.buffers.find(b.key());
-        if (it != snap.buffers.end()) {
-            b.value().copy_(it->second.to(b.value().device(), b.value().scalar_type()));
-        }
-    }
-}
 
 // ------------------------------------------------------------
 // ReplayBuffer: X + SPARSE policy target + z
@@ -4751,10 +4721,10 @@ struct ReplayBuffer {
     size_t head = 0;
     size_t size = 0;
 
-    // Ñòåïåíü "ñâåæåñòè" äàííûõ (Prioritized Replay Lite).
-    // 1.0  = ïîëíîñòüþ ðàâíîìåðíûé âûáîð (êàê áûëî).
-    // 0.75 = ëåãêèé ïðèîðèòåò ñâåæèì èãðàì (çîëîòàÿ ñåðåäèíà äëÿ AlphaZero).
-    // 0.5  = ñèëüíûé ïåðåêîñ â ñòîðîíó òîëüêî ÷òî ñûãðàííûõ ïàðòèé.
+    // Степень "свежести" данных (Prioritized Replay Lite).
+    // 1.0  = полностью равномерный выбор (как было).
+    // 0.75 = легкий приоритет свежим играм (золотая середина для AlphaZero).
+    // 0.5  = сильный перекос в сторону только что сыгранных партий.
     double recent_bias = 0.75;
 
     std::mutex m;
@@ -4771,15 +4741,15 @@ struct ReplayBuffer {
     }
 
     bool sampleBatch(std::vector<TrainSample>& out, int B, std::mt19937& rng) {
-        // 1. Èçìåíÿåì ðàçìåð âåêòîðà ÄÎ çàõâàòà ìüþòåêñà.
-        // Ýòî óáèðàåò ìèêðî-ôðèçû (Lock Contention), ïîçâîëÿÿ Self-play ïîòîêàì
-        // áûñòðåå ñêëàäûâàòü íîâûå ïàðòèè â áóôåð.
+        // 1. Изменяем размер вектора ДО захвата мьютекса.
+        // Это убирает микро-фризы (Lock Contention), позволяя Self-play потокам
+        // быстрее складывать новые партии в буфер.
         out.resize((size_t)B);
 
         std::lock_guard<std::mutex> lk(m);
         if (size < (size_t)B) return false;
 
-        // Èñïîëüçóåì íåïðåðûâíîå ðàñïðåäåëåíèå [0.0, 1.0)
+        // Используем непрерывное распределение [0.0, 1.0)
         std::uniform_real_distribution<double> d(0.0, 1.0);
 
         auto phys = [&](size_t logical) -> size_t {
@@ -4790,13 +4760,13 @@ struct ReplayBuffer {
         for (int i = 0; i < B; ++i) {
             double u = d(rng);
 
-            // 2. Ìàòåìàòè÷åñêèé òðþê: âîçâîäèì 'u' â ñòåïåíü < 1.0.
-            // Ãðàôèê ôóíêöèè y = x^0.75 âûãèáàåòñÿ ââåðõ. 
-            // Ýòî çíà÷èò, ÷òî ñëó÷àéíûå çíà÷åíèÿ áóäóò ÷àùå ñìåùàòüñÿ áëèæå ê 1.0
-            // Ëîãè÷åñêèé èíäåêñ 0  ñàìàÿ ñòàðàÿ ïîçèöèÿ, (size - 1)  ñàìàÿ íîâàÿ.
+            // 2. Математический трюк: возводим 'u' в степень < 1.0.
+            // График функции y = x^0.75 выгибается вверх. 
+            // Это значит, что случайные значения будут чаще смещаться ближе к 1.0
+            // Логический индекс 0 — самая старая позиция, (size - 1) — самая новая.
             size_t li = (size_t)(size * std::pow(u, recent_bias));
 
-            if (li >= size) li = size - 1; // Çàùèòà îò âûõîäà çà ïðåäåëû
+            if (li >= size) li = size - 1; // Защита от выхода за пределы
 
             out[(size_t)i] = buf[phys(li)];
         }
@@ -4810,11 +4780,11 @@ struct ReplayBuffer {
 };
 
 // ------------------------------------------------------------
-// TRT refit èç libtorch ìîäåëè + ïåðåñîçäàíèå Context + CUDA Graph
+// TRT refit из libtorch модели + пересоздание Context + CUDA Graph
 // ------------------------------------------------------------
 
-static std::mutex g_trtMutex;     // çàùèùàåì TRT enqueue/refit/serialize
-static std::mutex g_modelMutex;   // çàùèùàåì ÷òåíèå/çàïèñü âåñîâ ìîäåëè è optimizer step
+static std::mutex g_trtMutex;     // защищаем TRT enqueue/refit/serialize
+static std::mutex g_modelMutex;   // защищаем чтение/запись весов модели и optimizer step
 // Always lock BOTH in the same order, deadlock-free (C++17)
 static AI_FORCEINLINE std::scoped_lock<std::mutex, std::mutex> lockModelTrt() {
     return std::scoped_lock<std::mutex, std::mutex>(g_modelMutex, g_trtMutex);
@@ -4834,7 +4804,7 @@ static std::vector<float> tensorToHostVecF32(const torch::Tensor& tIn) {
     return v;
 }
 
-// Pretty-print missing refit weights (IMPORTANT: èíà÷å refit ìîæåò "ìîë÷à" áûòü ÷àñòè÷íûì).
+// Pretty-print missing refit weights (IMPORTANT: иначе refit может "молча" быть частичным).
 static void trtDumpMissingRefitWeights(nvinfer1::IRefitter& ref) {
     using namespace nvinfer1;
 
@@ -4925,7 +4895,7 @@ static bool trtRecreateContextAndRebindAndGraph(TrtRunner& trt) {
 // - Keep all host vectors alive until refitCudaEngine() finishes.
 // =============================================================
 
-// RAII: âðåìåííî ïåðåâåñòè ìîäåëü â eval() íà âðåìÿ refit è âåðíóòü ðåæèì îáðàòíî.
+// RAII: временно перевести модель в eval() на время refit и вернуть режим обратно.
 struct ScopedModelEval {
     Net& model;
     bool wasTraining = false;
@@ -4945,11 +4915,11 @@ static bool trtRefitFromTorchModel(TrtRunner& trt, Net& model) {
 
     if (!trt.engine || !trt.ctx) return false;
 
-    // IMPORTANT: refit äåëàåì èç eval(), ÷òîáû BN running stats íå ìåíÿëèñü.
+    // IMPORTANT: refit делаем из eval(), чтобы BN running stats не менялись.
     ScopedModelEval evalGuard(model);
     torch::NoGradGuard ng;
 
-    // Åñëè ìîäåëü íà CUDA  ìîæíî ñèíõðîíèçèðîâàòüñÿ (îïöèîíàëüíî, íî áåçîïàñíî).
+    // Если модель на CUDA — можно синхронизироваться (опционально, но безопасно).
     try {
         auto params = model->parameters(); // std::vector<at::Tensor>
         if (!params.empty()) {
@@ -4963,7 +4933,7 @@ static bool trtRefitFromTorchModel(TrtRunner& trt, Net& model) {
     if (!ref) return false;
 
     // Keep host vectors alive (TensorRT reads weights during refitCudaEngine()).
-    // std::deque ãàðàíòèðóåò ñòàáèëüíîñòü àäðåñîâ ýëåìåíòîâ.
+    // std::deque гарантирует стабильность адресов элементов.
     std::deque<std::vector<float>> keep;
 
     auto pushKeep = [&](std::vector<float>&& v) -> nvinfer1::Weights {
@@ -5158,7 +5128,7 @@ static bool trtSavePlanToDisk(TrtRunner& trt, const std::string& planFile) {
 
 
 // ------------------------------------------------------------
-// Inference server äëÿ îáó÷åíèÿ (CV âìåñòî busy-wait), + g_trtMutex
+// Inference server для обучения (CV вместо busy-wait), + g_trtMutex
 // ------------------------------------------------------------
 static std::atomic<int> g_inferInFlight{ 0 };
 
@@ -5355,7 +5325,7 @@ private:
 };
 
 // ------------------------------------------------------------
-// SearchPool: ïîñòîÿííûå MCTS-âîðêåðû (ÍÅ ïåðåñîçäà¸ì ïîòîêè íà êàæäûé search)
+// SearchPool: постоянные MCTS-воркеры (НЕ пересоздаём потоки на каждый search)
 // ------------------------------------------------------------
 static AI_FORCEINLINE bool tryClaimSimBudget(std::atomic<int>& simsLeft) {
     int cur = simsLeft.load(std::memory_order_relaxed);
@@ -5366,7 +5336,7 @@ static AI_FORCEINLINE bool tryClaimSimBudget(std::atomic<int>& simsLeft) {
                 std::memory_order_relaxed)) {
             return true;
         }
-        // cur îáíîâèòñÿ compare_exchange_weak'îì
+        // cur обновится compare_exchange_weak'ом
     }
     return false;
 }
@@ -5439,8 +5409,8 @@ struct SearchPool {
         }
         cv.notify_all();
 
-        // ÂÀÆÍÎ: äàæå åñëè TT.abort == true, ìû âñ¸ ðàâíî æä¸ì,
-        // ÷òîáû âîðêåðû ãàðàíòèðîâàííî âûøëè, èíà÷å íåëüçÿ äåëàòü T.newGame().
+        // ВАЖНО: даже если TT.abort == true, мы всё равно ждём,
+        // чтобы воркеры гарантированно вышли, иначе нельзя делать T.newGame().
         const auto t0 = std::chrono::steady_clock::now();
         const auto hardTimeout = std::chrono::seconds(2);
 
@@ -5448,13 +5418,13 @@ struct SearchPool {
             if (workersBusy.load(std::memory_order_relaxed) == 0) break;
 
             if (TT.abort.load(std::memory_order_relaxed)) {
-                // óñêîðÿåì îñòàíîâ
+                // ускоряем останов
                 cancelJob.store(true, std::memory_order_relaxed);
                 simsLeft.store(0, std::memory_order_relaxed);
             }
 
             if (std::chrono::steady_clock::now() - t0 > hardTimeout) {
-                // Åñëè ðåàëüíî çàâèñëè  ëó÷øå îñòàíîâèòü ïóë, ÷åì ïðîäîëæàòü ñ áèòûì ñîñòîÿíèåì.
+                // Если реально зависли — лучше остановить пул, чем продолжать с битым состоянием.
                 std::cerr << "[SearchPool] ERROR: workers did not stop in time. Forcing shutdown.\n";
                 shutdown();
                 break;
@@ -5543,7 +5513,7 @@ for (;;) {
 
 // ------------------------------------------------------------
 // Search fixed number of simulations (sims) with tree reuse
-// Dirichlet noise ïðèìåíÿåòñÿ ÒÎËÜÊÎ âðåìåííî íà root (íå ïîðòèò priors â TT íàâñåãäà)
+// Dirichlet noise применяется ТОЛЬКО временно на root (не портит priors в TT навсегда)
 // ------------------------------------------------------------
 
 // Expand root (or any node keyed by rootPos) exactly once for training-selfplay.
@@ -5709,7 +5679,7 @@ static int pickMoveFromVisits(const std::vector<moveState>& mv, float temperatur
     return mv.back().move;
 }
 
-// policy target  SPARSE (idx/prob), idx â CHW: k=pl*64+sq
+// policy target — SPARSE (idx/prob), idx в CHW: k=pl*64+sq
 static void buildSparsePolicyTargetCHW(const Position& pos,
     const std::vector<moveState>& mv,
     uint16_t& outN,
@@ -5744,7 +5714,7 @@ static void buildSparsePolicyTargetCHW(const Position& pos,
     }
 }
 
-// âðåìåííî (íà îäèí search) çàøóìëèâàåì root priors è ïîòîì îòêàòûâàåì íàçàä
+// временно (на один search) зашумливаем root priors и потом откатываем назад
 static void runFixedSims(MCTSTable& T,
     SearchPool& pool,
     InferenceServerTrain& srv,
@@ -5762,8 +5732,8 @@ static void runFixedSims(MCTSTable& T,
     TTEdge* e0 = nullptr;
     int nEdges = 0;
 
-    // Ñîõðàíÿåì root priors â ñûðîì êâàíòîâàííîì âèäå, ÷òîáû ïîòîì
-    // âîññòàíîâèòü èõ áåç ëèøíåé îøèáêè îêðóãëåíèÿ.
+    // Сохраняем root priors в сыром квантованном виде, чтобы потом
+    // восстановить их без лишней ошибки округления.
     std::vector<uint16_t> savedPriorQ;
 
     if (rootNoise &&
@@ -5792,7 +5762,7 @@ static void runFixedSims(MCTSTable& T,
 
     srv.waitIdle();
 
-    // Âîññòàíàâëèâàåì èñõîäíûå root priors.
+    // Восстанавливаем исходные root priors.
     if (!savedPriorQ.empty() && e0 && nEdges > 0) {
         for (int i = 0; i < nEdges; ++i) {
             e0[i].setPriorRaw(savedPriorQ[(size_t)i]);
@@ -5801,7 +5771,7 @@ static void runFixedSims(MCTSTable& T,
 }
 
 // ------------------------------------------------------------
-// Self-play: ïåðåèñïîëüçóåì îäèí MCTSTable + îäèí InferenceServerTrain + SearchPool
+// Self-play: переиспользуем один MCTSTable + один InferenceServerTrain + SearchPool
 // ------------------------------------------------------------
 
 static AI_FORCEINLINE void resetMCTSTableForNewGame(MCTSTable& T) {
@@ -5911,7 +5881,7 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
 
     float zWhite = 0.5f;
     if (outTerminated) {
-        // term îçíà÷àåò "ó side-to-move åñòü íåìåäëåííàÿ ïîáåäà (âçÿòèå êîðîëÿ)".
+        // term означает "у side-to-move есть немедленная победа (взятие короля)".
         // winner = side-to-move => whiteWin = 1 - pos.side
         zWhite = 1.0f - pos.side;
     }
@@ -5926,7 +5896,7 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
 }
 
 // ------------------------------------------------------------
-// Trainer thread: sparse policy loss ÷åðåç gather(logp, idx)
+// Trainer thread: sparse policy loss через gather(logp, idx)
 // + pin_memory/non_blocking, + grad clipping, + NaN guard
 // ------------------------------------------------------------
 
@@ -5970,8 +5940,8 @@ double   warmupStartFactor = 0.10;         // 0.05..0.25 usually good
     // State
     uint64_t steps = 0;
     float lastLoss = 0.0f;
-    float lastLossP = 0.0f; // <--- ÄÎÁÀÂÈÒÜ ÝÒÎ
-    float lastLossV = 0.0f; // <--- ÄÎÁÀÂÈÒÜ ÝÒÎ
+    float lastLossP = 0.0f; // <--- ДОБАВИТЬ ЭТО
+    float lastLossV = 0.0f; // <--- ДОБАВИТЬ ЭТО
 double computeBaseLRFromSteps(uint64_t s) const {
     double lr = initial_lr;
     for (uint64_t ms : lr_milestones) {
@@ -6122,8 +6092,8 @@ updateLR(true);
             }
 
             float lossScalar = 0.0f;
-            float lossPScalar = 0.0f; // <--- ÄÎÁÀÂÈÒÜ
-            float lossVScalar = 0.0f; // <--- ÄÎÁÀÂÈÒÜ
+            float lossPScalar = 0.0f; // <--- ДОБАВИТЬ
+            float lossVScalar = 0.0f; // <--- ДОБАВИТЬ
             bool didStep = false;
 
             {
@@ -6148,8 +6118,8 @@ updateLR(true);
                     opt->step();
 
                     lossScalar = loss.item<float>();
-                    lossPScalar = lossP.item<float>(); // <--- ÑÎÕÐÀÍßÅÌ lossP
-                    lossVScalar = lossV.item<float>(); // <--- ÑÎÕÐÀÍßÅÌ lossV
+                    lossPScalar = lossP.item<float>(); // <--- СОХРАНЯЕМ lossP
+                    lossVScalar = lossV.item<float>(); // <--- СОХРАНЯЕМ lossV
                     didStep = true;
                 }
             }
@@ -6159,8 +6129,8 @@ updateLR(true);
             ++done;
             ++steps;
             lastLoss = lossScalar;
-            lastLossP = lossPScalar; // <--- ÎÁÍÎÂËßÅÌ STATE ÒÐÅÍÅÐÀ
-            lastLossV = lossVScalar; // <--- ÎÁÍÎÂËßÅÌ STATE ÒÐÅÍÅÐÀ
+            lastLossP = lossPScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
+            lastLossV = lossVScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
             updateLR();
         }
 
@@ -6352,21 +6322,21 @@ static void initAllOrExit(Net& model,
     else          initSlidersMagics();
 
     if (!loadOrCreateTorchModel(ptFile, model)) {
-        std::cerr << "Íå óäàëîñü çàãðóçèòü/ñîçäàòü " << ptFile << "\n";
+        std::cerr << "Не удалось загрузить/создать " << ptFile << "\n";
         std::exit(1);
     }
 
     {
         std::lock_guard<std::mutex> lk(g_trtMutex);
         if (!g_trt.initOrCreate(planFile)) {
-            std::cerr << "TensorRT: íå óäàëîñü èíèöèàëèçèðîâàòü äâèæîê.\n";
+            std::cerr << "TensorRT: не удалось инициализировать движок.\n";
             std::exit(1);
         }
         g_trtReady = true;
         g_nnBatch = TRT_MAX_BATCH;
     }
 
-    // Ïåðâè÷íûé refit
+    // Первичный refit
     {
         std::scoped_lock lk(g_modelMutex, g_trtMutex);
         torch::NoGradGuard ng;
@@ -6416,133 +6386,15 @@ static void saveAll(const std::string& ptFile,
 // ------------------------------------------------------------
 
 static void safeRefitBarrier(SelfPlayContext& sp) {
-    // Ãàðàíòèðóåì, ÷òî íà ìîìåíò refit:
+    // Гарантируем, что на момент refit:
     // - server idle
-    // - î÷åðåäü ïóñòà
+    // - очередь пуста
     sp.server.waitIdle();
     sp.server.clearQueueUnsafeWhenIdle();
 }
 
-static int pickMoveFromPolicySimulations(Net& model,
-    const Position& pos,
-    const std::array<int, 64>& mask,
-    const MoveList& ml,
-    int simulations) {
-    if (ml.n <= 0) return 0;
 
-    std::array<float, NN_INPUT_SIZE> x{};
-    positionToNNInput(pos, x);
 
-    auto in = torch::from_blob(x.data(), { 1, NN_SQ_PLANES, 8, 8 }, torch::kFloat32).clone();
-    if (model->parameters().size() > 0) {
-        auto dev = model->parameters().front().device();
-        in = in.to(dev);
-    }
-
-    torch::NoGradGuard ng;
-    auto out = model->forward(in);
-    auto logits = out.first.view({ POLICY_SIZE }).to(torch::kCPU);
-
-    std::vector<int> legalIdx;
-    legalIdx.reserve((size_t)ml.n);
-    for (int i = 0; i < ml.n; ++i) {
-        int idx = policyIndexCHWCanonical(ml.m[i], pos);
-        if (idx < 0 || idx >= POLICY_SIZE) idx = 0;
-        legalIdx.push_back(idx);
-    }
-
-    auto idxTensor = torch::tensor(legalIdx, torch::TensorOptions().dtype(torch::kInt64));
-    auto legalLogits = logits.index_select(0, idxTensor);
-    auto probs = torch::softmax(legalLogits, 0).to(torch::kFloat32).contiguous();
-
-    std::vector<float> prob((size_t)ml.n, 0.0f);
-    std::memcpy(prob.data(), probs.data_ptr<float>(), sizeof(float) * (size_t)ml.n);
-
-    std::discrete_distribution<int> pick(prob.begin(), prob.end());
-    std::vector<int> visits((size_t)ml.n, 0);
-    simulations = std::max(1, simulations);
-    for (int i = 0; i < simulations; ++i) {
-        int k = pick(Random);
-        if (k >= 0 && k < ml.n) ++visits[(size_t)k];
-    }
-
-    int best = 0;
-    for (int i = 1; i < ml.n; ++i) {
-        if (visits[(size_t)i] > visits[(size_t)best]) best = i;
-    }
-    return ml.m[best];
-}
-
-static float playArenaGamePolicySim(Net& currentModel,
-    Net& oldModel,
-    bool currentIsWhite,
-    int simulationsPerMove,
-    int maxPlies) {
-    Position pos;
-    std::array<uint64_t, 4> path;
-    std::array<int, 64> mask;
-    chess960(pos, path, mask);
-
-    MoveList ml;
-    int term = 0;
-
-    for (int ply = 0; ply < maxPlies; ++ply) {
-        genLegal(pos, path, mask, ml, term);
-        if (term) {
-            float zWhite = 1.0f - pos.side;
-            if (currentIsWhite) return zWhite;
-            return 1.0f - zWhite;
-        }
-
-        if (ml.n == 0) {
-            makeRandom(pos, nullptr);
-            continue;
-        }
-
-        bool currentTurn = (pos.side == 0) ? currentIsWhite : (!currentIsWhite);
-        Net& actor = currentTurn ? currentModel : oldModel;
-        int mv = pickMoveFromPolicySimulations(actor, pos, mask, ml, simulationsPerMove);
-        if (!mv) return 0.5f;
-        makeMove(pos, mask, mv);
-    }
-
-    return 0.5f;
-}
-
-static void runArenaMatchPolicySim(Net& model,
-    const ModelSnapshot& oldSnapshot,
-    int games,
-    int simulationsPerMove) {
-    if (games <= 0) return;
-
-    Net oldModel;
-    oldModel->to(torch::kCPU);
-    loadModelSnapshot(oldModel, oldSnapshot);
-
-    bool wasTraining = model->is_training();
-    model->eval();
-    oldModel->eval();
-
-    float score = 0.0f;
-    int wins = 0, losses = 0, draws = 0;
-
-    for (int g = 0; g < games; ++g) {
-        bool currentIsWhite = ((g & 1) == 0);
-        float s = playArenaGamePolicySim(model, oldModel, currentIsWhite, simulationsPerMove, 256);
-        score += s;
-        if (s > 0.75f) ++wins;
-        else if (s < 0.25f) ++losses;
-        else ++draws;
-    }
-
-    std::cerr << "[arena] current vs old: games=" << games
-        << " sims=" << simulationsPerMove
-        << " score=" << score
-        << " winrate=" << (score / (float)games)
-        << " (W/D/L=" << wins << "/" << draws << "/" << losses << ")\n";
-
-    if (wasTraining) model->train();
-}
 void Training(int targetGames) {
     const std::string ptFile = "net.pt";
     const std::string planFile = "net.plan";
@@ -6556,7 +6408,7 @@ void Training(int targetGames) {
     static constexpr size_t REPLAY_CAP = 1000000;
     ReplayBuffer rb(REPLAY_CAP);
 
-    // Trainer: ñíà÷àëà âîññòàíîâèì steps, ïîòîì init(), ïîòîì optimizer
+    // Trainer: сначала восстановим steps, потом init(), потом optimizer
     Trainer trainer;
 
     if (loadTrainerState(trainerStateFile, trainer)) {
@@ -6571,7 +6423,7 @@ void Training(int targetGames) {
     if (loadOptimizerState(optFile, trainer)) {
         std::cerr << "[Trainer] optimizer state restored.\n";
 
-        // Ïîñëå restore optimizer åù¸ ðàç ïðèíóäèòåëüíî âûñòàâèì LR ïî scheduler'ó
+        // После restore optimizer ещё раз принудительно выставим LR по scheduler'у
         trainer.current_lr = -1.0;
         trainer.updateLR(true);
     }
@@ -6613,13 +6465,7 @@ void Training(int targetGames) {
     int trainBlocks = 0;
     int refits = 0;
 
-    ModelSnapshot oldModelSnapshot = captureModelSnapshot(model);
-    static constexpr int MATCH_EVERY_GAMES = 10000;
-    static constexpr int MATCH_GAMES = 1000;
-    static constexpr int MATCH_SIMS_PER_MOVE = 200;
-    int nextMatchAt = MATCH_EVERY_GAMES;
-
-    std::cout << "Íà÷èíàåì òðåíèðîâêó íà " << targetGames << " ïàðòèé...\n";
+    std::cout << "Начинаем тренировку на " << targetGames << " партий...\n";
 
     while (games < targetGames) {
         // ===========================
@@ -6644,13 +6490,6 @@ void Training(int targetGames) {
 
             ++games;
             ++gamesThisBlock;
-
-            if (games >= nextMatchAt) {
-                safeRefitBarrier(sp);
-                runArenaMatchPolicySim(model, oldModelSnapshot, MATCH_GAMES, MATCH_SIMS_PER_MOVE);
-                oldModelSnapshot = captureModelSnapshot(model);
-                nextMatchAt += MATCH_EVERY_GAMES;
-            }
 
             if (sp.T.abort.load(std::memory_order_relaxed)) {
                 std::cerr << "[selfplay] MCTS aborted: oomCode=" << sp.T.oomCode.load()
@@ -6701,7 +6540,7 @@ void Training(int targetGames) {
 
             saveAll(ptFile, planFile, optFile, trainerStateFile, model, trainer);
 
-            std::cout << "[autosave] Ïðîãðåññ: " << games << " / " << targetGames << " ïàðòèé.\n";
+            std::cout << "[autosave] Прогресс: " << games << " / " << targetGames << " партий.\n";
         }
 
         if (now >= nextStat) {
@@ -6724,7 +6563,7 @@ void Training(int targetGames) {
     safeRefitBarrier(sp);
     sp.stop();
 
-    std::cout << "\n[Çàâåðøåíèå] Ñîáðàíî " << targetGames << " ïàðòèé. Ñîõðàíåíèå ôèíàëüíûõ âåñîâ...\n";
+    std::cout << "\n[Завершение] Собрано " << targetGames << " партий. Сохранение финальных весов...\n";
     {
         std::lock_guard<std::mutex> lk(g_modelMutex);
 
@@ -6744,7 +6583,7 @@ void Training(int targetGames) {
         }
     }
 
-    std::cout << "[Çàâåðøåíèå] Çàïóñê ôèíàëüíîé ïåðåñáîðêè TensorRT (Rebuild). Ýòî çàéìåò ïàðó ìèíóò...\n";
+    std::cout << "[Завершение] Запуск финальной пересборки TensorRT (Rebuild). Это займет пару минут...\n";
 
     // 1) shutdown + remove old plan
     {
@@ -6762,7 +6601,7 @@ void Training(int targetGames) {
     }
 
     if (!okInit) {
-        std::cerr << "[Çàâåðøåíèå] FATAL ERROR: Íå óäàëîñü ïåðåñîáðàòü ôèíàëüíûé net.plan!\n";
+        std::cerr << "[Завершение] FATAL ERROR: Не удалось пересобрать финальный net.plan!\n";
     }
     else {
         // 3) refit from final torch model and save final plan
@@ -6783,7 +6622,7 @@ void Training(int targetGames) {
         }
     }
 
-    std::cout << "Òðåíèðîâêà óñïåøíî çàâåðøåíà! Ôàéëû net.pt, optimizer.pt, trainer_state.bin è net.plan ãîòîâû.\n";
+    std::cout << "Тренировка успешно завершена! Файлы net.pt, optimizer.pt, trainer_state.bin и net.plan готовы.\n";
 }
 
 
@@ -6792,7 +6631,7 @@ int main() {
     const std::string ptFile = "net.pt";
     const std::string planFile = "net.plan";
 
-    std::cout << "Ââåäèòå FEN (èëè '960' äëÿ ñëó÷àéíîé Chess960 ïîçèöèè, '-' äëÿ Training):\n";
+    std::cout << "Введите FEN (или '960' для случайной Chess960 позиции, '-' для Training):\n";
     std::string fen;
     std::getline(std::cin, fen);
 
@@ -6807,7 +6646,7 @@ int main() {
     Net model;
     initAllOrExit(model, ptFile, planFile);
     if (!g_trtReady) {
-        std::cout << "TensorRT äâèæîê íå çàãðóæåí.\n";
+        std::cout << "TensorRT движок не загружен.\n";
         return 1;
     }
 
