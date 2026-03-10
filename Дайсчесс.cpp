@@ -3320,6 +3320,9 @@ struct MCTSTable {
 
         int probe = 0;
         int lockSpins = 0;
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point lockStart = Clock::time_point{};
+        uint64_t lockStartIdx = ~0ull;
 
         while (probe < PROBE_LIMIT) {
             MCTSSlot& s = slots[(size_t)idx];
@@ -3363,10 +3366,6 @@ struct MCTSTable {
             }
 
             if (mt == TAG_LOCKED32) {
-                using Clock = std::chrono::steady_clock;
-                Clock::time_point lockStart = Clock::time_point{};
-                uint64_t lockStartIdx = ~0ull;
-
                 // ôèêñèðóåì "íà÷àëî îæèäàíèÿ" äëÿ êîíêðåòíîãî ñëîòà idx
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
