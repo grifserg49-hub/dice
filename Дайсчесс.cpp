@@ -4785,6 +4785,31 @@ struct ReplayBuffer {
 
 static std::mutex g_trtMutex;     // защищаем TRT enqueue/refit/serialize
 static std::mutex g_modelMutex;   // защищаем чтение/запись весов модели и optimizer step
+static TrtRunner g_trt_old;
+static bool g_trtOldReady = false;
+static std::mutex g_trtOldMutex;
+
+// Во время обычного training/self-play active = current.
+// Во время arena временно переключаем на old/current для нужной стороны.
+static TrtRunner* g_activeTrt = &g_trt;
+static std::mutex* g_activeTrtMutex = &g_trtMutex;
+
+struct ScopedActiveBackend {
+    TrtRunner* prevTrt = nullptr;
+    std::mutex* prevMtx = nullptr;
+
+    ScopedActiveBackend(TrtRunner& trt, std::mutex& mtx) {
+        prevTrt = g_activeTrt;
+        prevMtx = g_activeTrtMutex;
+        g_activeTrt = &trt;
+        g_activeTrtMutex = &mtx;
+    }
+
+    ~ScopedActiveBackend() {
+        g_activeTrt = prevTrt;
+        g_activeTrtMutex = prevMtx;
+    }
+};
 // Always lock BOTH in the same order, deadlock-free (C++17)
 static AI_FORCEINLINE std::scoped_lock<std::mutex, std::mutex> lockModelTrt() {
     return std::scoped_lock<std::mutex, std::mutex>(g_modelMutex, g_trtMutex);
@@ -5247,13 +5272,13 @@ private:
             bool ok = false;
             {
                 InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(g_trtMutex);
-                ok = g_trt.inferBatchGather(batch.data(), B);
+                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
+                ok = g_activeTrt->inferBatchGather(batch.data(), B);
             }
 
             for (int i = 0; i < B; ++i) {
-                float v = ok ? g_trt.valueHost(i) : 0.5f;
-                const float* logits = ok ? g_trt.gatherLogitsHostPtr(i) : neutralLogits.data();
+                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
+                const float* logits = ok ? g_activeTrt->gatherLogitsHostPtr(i) : neutralLogits.data();
                 expandLeafWithGatheredLogits(T, batch[(size_t)i], v, logits);
             }
 #else
@@ -5263,13 +5288,13 @@ private:
             bool ok = false;
             {
                 InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(g_trtMutex);
-                ok = g_trt.inferBatch(posBatch.data(), B);
+                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
+                ok = g_activeTrt->inferBatch(posBatch.data(), B);
             }
 
             for (int i = 0; i < B; ++i) {
-                float v = ok ? g_trt.valueHost(i) : 0.5f;
-                const float* pol = ok ? g_trt.policyHostPtr(i) : neutralPol.data();
+                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
+                const float* pol = ok ? g_activeTrt->policyHostPtr(i) : neutralPol.data();
                 expandLeafWithOutputs(T, batch[(size_t)i], v, pol);
             }
 #endif
@@ -5292,13 +5317,13 @@ private:
             bool ok = false;
             {
                 InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(g_trtMutex);
-                ok = g_trt.inferBatchGather(tail.data(), B);
+                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
+                ok = g_activeTrt->inferBatchGather(tail.data(), B);
             }
 
             for (int i = 0; i < B; ++i) {
-                float v = ok ? g_trt.valueHost(i) : 0.5f;
-                const float* logits = ok ? g_trt.gatherLogitsHostPtr(i) : neutralLogits.data();
+                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
+                const float* logits = ok ? g_activeTrt->gatherLogitsHostPtr(i) : neutralLogits.data();
                 expandLeafWithGatheredLogits(T, tail[(size_t)i], v, logits);
             }
 #else
@@ -5308,13 +5333,13 @@ private:
             bool ok = false;
             {
                 InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(g_trtMutex);
-                ok = g_trt.inferBatch(posBatch.data(), B);
+                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
+                ok = g_activeTrt->inferBatch(posBatch.data(), B);
             }
 
             for (int i = 0; i < B; ++i) {
-                float v = ok ? g_trt.valueHost(i) : 0.5f;
-                const float* pol = ok ? g_trt.policyHostPtr(i) : neutralPol.data();
+                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
+                const float* pol = ok ? g_activeTrt->policyHostPtr(i) : neutralPol.data();
                 expandLeafWithOutputs(T, tail[(size_t)i], v, pol);
             }
 #endif
@@ -5585,14 +5610,14 @@ static void ensureExpandedTrain(MCTSTable& T,
         bool ok = false;
         {
             InferInFlightGuard ig;             // trainer yields while TRT is running
-            std::lock_guard<std::mutex> lk(g_trtMutex);
-            ok = g_trt.inferBatchGather(&p, 1);
+            std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
+            ok = g_activeTrt->inferBatchGather(&p, 1);
         }
 
-        v = ok ? g_trt.valueHost(0) : 0.5f;
+        v = ok ? g_activeTrt->valueHost(0) : 0.5f;
 
         if (ok) {
-            const float* logits = g_trt.gatherLogitsHostPtr(0);
+            const float* logits = g_activeTrt->gatherLogitsHostPtr(0);
             expandLeafWithGatheredLogits(T, p, v, logits);
             return;
         }
@@ -5609,8 +5634,8 @@ static void ensureExpandedTrain(MCTSTable& T,
     bool ok = false;
     {
         InferInFlightGuard ig;
-        std::lock_guard<std::mutex> lk(g_trtMutex);
-        ok = g_trt.inferBatch(&p.pos, 1, &v, pol.data());
+        std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
+        ok = g_activeTrt->inferBatch(&p.pos, 1, &v, pol.data());
     }
     if (!ok) {
         v = 0.5f;
@@ -5809,6 +5834,148 @@ struct SelfPlayContext {
         resetMCTSTableForNewGame(T);
     }
 };
+
+struct ArenaStats {
+    int curWins = 0;
+    int oldWins = 0;
+    int draws = 0;
+
+    double currentScore() const {
+        int n = curWins + oldWins + draws;
+        if (n <= 0) return 0.5;
+        return ((double)curWins + 0.5 * (double)draws) / (double)n;
+    }
+};
+
+static int playOneArenaGame(SelfPlayContext& curCtx,
+                            SelfPlayContext& oldCtx,
+                            const Position& startPos,
+                            const std::array<uint64_t, 4>& path,
+                            const std::array<int, 64>& mask,
+                            bool currentIsWhite,
+                            int simsPerPos,
+                            int maxPlies = 256) {
+    Position pos = startPos;
+
+    for (int ply = 0; ply < maxPlies; ++ply) {
+        MoveList ml;
+        int term = 0;
+        Position tmp = pos;
+        genLegal(tmp, path, mask, ml, term);
+
+        if (term) {
+            // winner = side-to-move
+            bool currentWon = ((pos.side == 0) == currentIsWhite);
+            return currentWon ? +1 : -1;
+        }
+
+        if (ml.n == 0) {
+            bool currentTurn = ((pos.side == 0) == currentIsWhite);
+            TTNode* n = currentTurn
+                ? curCtx.T.findNodeNoInsert(pos.key)
+                : oldCtx.T.findNodeNoInsert(pos.key);
+            makeRandom(pos, n);
+            continue;
+        }
+
+        bool currentTurn = ((pos.side == 0) == currentIsWhite);
+        SelfPlayContext& ctx = currentTurn ? curCtx : oldCtx;
+
+        std::vector<moveState> moves;
+        float q = 0.5f;
+
+        {
+            ScopedActiveBackend use(
+                currentTurn ? g_trt : g_trt_old,
+                currentTurn ? g_trtMutex : g_trtOldMutex
+            );
+
+            runFixedSims(ctx.T, ctx.pool, ctx.server, pos, path, mask,
+                         simsPerPos, /*rootNoise=*/false);
+
+            if (ctx.T.abort.load(std::memory_order_relaxed)) {
+                return 0;
+            }
+
+            collectRootMoves(ctx.T, pos, q, moves);
+        }
+
+        if (moves.empty()) return 0;
+
+        int mv = moves[0].move; // temperature=0, best by visits
+        if (!mv) return 0;
+
+        makeMove(pos, mask, mv);
+    }
+
+    return 0; // draw by maxPlies
+}
+
+static ArenaStats runArenaMatch(int games, int simsPerPos) {
+    ArenaStats st;
+
+    SelfPlayContext curCtx(/*nodePow2=*/(1u << 19), /*edgeCap=*/(1u << 23));
+    SelfPlayContext oldCtx(/*nodePow2=*/(1u << 19), /*edgeCap=*/(1u << 23));
+
+    curCtx.start();
+    oldCtx.start();
+
+    const int pairs = games / 2;
+
+    for (int g = 0; g < pairs; ++g) {
+        Position startPos;
+        std::array<uint64_t, 4> path;
+        std::array<int, 64> mask;
+        chess960(startPos, path, mask);
+
+        // game 1: current = white
+        curCtx.resetForNewGame();
+        oldCtx.resetForNewGame();
+        {
+            int r = playOneArenaGame(curCtx, oldCtx, startPos, path, mask, true, simsPerPos);
+            if (r > 0) ++st.curWins;
+            else if (r < 0) ++st.oldWins;
+            else ++st.draws;
+        }
+
+        // game 2: current = black
+        curCtx.resetForNewGame();
+        oldCtx.resetForNewGame();
+        {
+            int r = playOneArenaGame(curCtx, oldCtx, startPos, path, mask, false, simsPerPos);
+            if (r > 0) ++st.curWins;
+            else if (r < 0) ++st.oldWins;
+            else ++st.draws;
+        }
+
+        if (((g + 1) % 50) == 0) {
+            std::cout << "[arena] pair " << (g + 1) << "/" << pairs
+                      << "  W/D/L = "
+                      << st.curWins << "/" << st.draws << "/" << st.oldWins
+                      << "  score=" << st.currentScore() << "\n";
+        }
+    }
+
+    if (games & 1) {
+        Position startPos;
+        std::array<uint64_t, 4> path;
+        std::array<int, 64> mask;
+        chess960(startPos, path, mask);
+
+        curCtx.resetForNewGame();
+        oldCtx.resetForNewGame();
+
+        int r = playOneArenaGame(curCtx, oldCtx, startPos, path, mask, true, simsPerPos);
+        if (r > 0) ++st.curWins;
+        else if (r < 0) ++st.oldWins;
+        else ++st.draws;
+    }
+
+    curCtx.stop();
+    oldCtx.stop();
+
+    return st;
+}
 
 static void selfPlayOneGame960(SelfPlayContext& sp,
     ReplayBuffer& rb,
@@ -6228,6 +6395,62 @@ static bool loadOrCreateTorchModel(const std::string& ptFile, Net& model) {
         }
     }
 }
+
+static void copyNetState(Net& dst, Net& src) {
+    torch::NoGradGuard ng;
+
+    auto srcParams = src->named_parameters(true);
+    auto dstParams = dst->named_parameters(true);
+    for (const auto& kv : srcParams) {
+        auto* d = dstParams.find(kv.key());
+        if (d) d->copy_(kv.value().detach().to(d->device(), d->scalar_type()));
+    }
+
+    auto srcBufs = src->named_buffers(true);
+    auto dstBufs = dst->named_buffers(true);
+    for (const auto& kv : srcBufs) {
+        auto* d = dstBufs.find(kv.key());
+        if (d) d->copy_(kv.value().detach().to(d->device(), d->scalar_type()));
+    }
+
+    if (src->is_training()) dst->train();
+    else                    dst->eval();
+}
+
+static bool ensureOldRunnerReady(const std::string& planFile) {
+    std::lock_guard<std::mutex> lk(g_trtOldMutex);
+    if (g_trtOldReady) return true;
+
+    if (!g_trt_old.initOrCreate(planFile)) return false;
+    g_trtOldReady = true;
+    return true;
+}
+
+static bool syncCurrentRunnerFromModel(Net& model) {
+    std::scoped_lock lk(g_modelMutex, g_trtMutex);
+    torch::NoGradGuard ng;
+    return trtRefitFromTorchModel(g_trt, model);
+}
+
+static bool snapshotCurrentIntoOld(Net& currentModel,
+                                   Net& oldModel,
+                                   const std::string& planFile) {
+    {
+        std::lock_guard<std::mutex> lk(g_modelMutex);
+        oldModel->to(torch::kCPU);
+        copyNetState(oldModel, currentModel);
+        oldModel->eval();
+    }
+
+    if (!ensureOldRunnerReady(planFile)) return false;
+
+    {
+        std::lock_guard<std::mutex> lk(g_trtOldMutex);
+        torch::NoGradGuard ng;
+        return trtRefitFromTorchModel(g_trt_old, oldModel);
+    }
+}
+
 static inline bool isFiniteF(float x) {
     return std::isfinite((double)x) != 0;
 }
@@ -6437,6 +6660,14 @@ void Training(int targetGames) {
         }
     }
 
+    Net oldModel;
+    oldModel->to(torch::kCPU);
+    oldModel->eval();
+
+    if (!snapshotCurrentIntoOld(model, oldModel, planFile)) {
+        std::cerr << "[arena] failed to initialize old snapshot in memory.\n";
+    }
+
     // One self-play context for the whole training
     SelfPlayContext sp(/*nodePow2=*/(1u << 20), /*edgeCap=*/(1u << 24));
     sp.start();
@@ -6464,6 +6695,7 @@ void Training(int targetGames) {
     int games = 0;
     int trainBlocks = 0;
     int refits = 0;
+    int nextArenaAt = 10000;
 
     std::cout << "Начинаем тренировку на " << targetGames << " партий...\n";
 
@@ -6527,6 +6759,47 @@ void Training(int targetGames) {
             else {
                 ++refits;
             }
+        }
+
+        while (games >= nextArenaAt) {
+            safeRefitBarrier(sp);
+
+            // current TRT должен точно соответствовать текущему model
+            if (!syncCurrentRunnerFromModel(model)) {
+                std::cerr << "[arena] failed to sync current TRT from model.\n";
+                break;
+            }
+
+            if (!g_trtOldReady) {
+                if (!snapshotCurrentIntoOld(model, oldModel, planFile)) {
+                    std::cerr << "[arena] failed to prepare old TRT snapshot.\n";
+                    break;
+                }
+            }
+
+            std::cout << "\n[arena] start: current vs old, games=1000, sims=200, triggerGames="
+                      << nextArenaAt << "\n";
+
+            ArenaStats ar = runArenaMatch(/*games=*/1000, /*simsPerPos=*/200);
+
+            std::cout << "[arena] done: W/D/L = "
+                      << ar.curWins << "/" << ar.draws << "/" << ar.oldWins
+                      << "  score=" << ar.currentScore() << "\n";
+
+            // promotion rule: если current > old, old := current
+            if (ar.currentScore() > 0.5) {
+                if (snapshotCurrentIntoOld(model, oldModel, planFile)) {
+                    std::cout << "[arena] promoted current -> old snapshot in memory\n";
+                }
+                else {
+                    std::cerr << "[arena] promotion failed\n";
+                }
+            }
+            else {
+                std::cout << "[arena] old snapshot kept\n";
+            }
+
+            nextArenaAt += 10000;
         }
 
         // ===========================
@@ -6620,6 +6893,12 @@ void Training(int targetGames) {
             g_trt.shutdown();
             g_trtReady = false;
         }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_trtOldMutex);
+        g_trt_old.shutdown();
+        g_trtOldReady = false;
     }
 
     std::cout << "Тренировка успешно завершена! Файлы net.pt, optimizer.pt, trainer_state.bin и net.plan готовы.\n";
