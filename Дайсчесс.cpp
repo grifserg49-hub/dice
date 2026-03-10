@@ -3320,6 +3320,9 @@ struct MCTSTable {
 
         int probe = 0;
         int lockSpins = 0;
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point lockStart = Clock::time_point{};
+        uint64_t lockStartIdx = ~0ull;
 
         while (probe < PROBE_LIMIT) {
             MCTSSlot& s = slots[(size_t)idx];
@@ -3363,10 +3366,6 @@ struct MCTSTable {
             }
 
             if (mt == TAG_LOCKED32) {
-                using Clock = std::chrono::steady_clock;
-                Clock::time_point lockStart = Clock::time_point{};
-                uint64_t lockStartIdx = ~0ull;
-
                 // ôèêñèðóåì "íà÷àëî îæèäàíèÿ" äëÿ êîíêðåòíîãî ñëîòà idx
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
@@ -4686,6 +4685,18 @@ struct NetImpl final : torch::nn::Module {
         v = v.contiguous().view({ v.size(0), HEAD_VALUE_C * 64 });
         v = torch::relu(valFC1->forward(v));
 
+        // Ïîëó÷àåì ñûðûå ëîãèòû
+        v = valFC2->forward(v);
+
+        if (!is_training()) {
+            v = torch::sigmoid(v);
+        }
+
+        return { pol, v };
+    }
+};
+TORCH_MODULE(Net);
+
 struct ModelSnapshot {
     std::unordered_map<std::string, torch::Tensor> params;
     std::unordered_map<std::string, torch::Tensor> buffers;
@@ -4717,19 +4728,6 @@ static void loadModelSnapshot(Net& model, const ModelSnapshot& snap) {
         }
     }
 }
-
-        // Ïîëó÷àåì ñûðûå ëîãèòû
-        v = valFC2->forward(v);
-
-
-        if (!is_training()) {
-            v = torch::sigmoid(v);
-        }
-
-        return { pol, v };
-    }
-};
-TORCH_MODULE(Net);
 
 // ------------------------------------------------------------
 // ReplayBuffer: X + SPARSE policy target + z
@@ -6418,6 +6416,13 @@ static void saveAll(const std::string& ptFile,
 // ------------------------------------------------------------
 
 static void safeRefitBarrier(SelfPlayContext& sp) {
+    // Ãàðàíòèðóåì, ÷òî íà ìîìåíò refit:
+    // - server idle
+    // - î÷åðåäü ïóñòà
+    sp.server.waitIdle();
+    sp.server.clearQueueUnsafeWhenIdle();
+}
+
 static int pickMoveFromPolicySimulations(Net& model,
     const Position& pos,
     const std::array<int, 64>& mask,
@@ -6441,7 +6446,7 @@ static int pickMoveFromPolicySimulations(Net& model,
     std::vector<int> legalIdx;
     legalIdx.reserve((size_t)ml.n);
     for (int i = 0; i < ml.n; ++i) {
-        int idx = policyIndexCHWCanonical(ml.m[i], pos.side, mask);
+        int idx = policyIndexCHWCanonical(ml.m[i], pos);
         if (idx < 0 || idx >= POLICY_SIZE) idx = 0;
         legalIdx.push_back(idx);
     }
@@ -6468,7 +6473,7 @@ static int pickMoveFromPolicySimulations(Net& model,
     return ml.m[best];
 }
 
-static float playArenaGamePolicySim(Net& currentModel,
+static float playArenaGamePolicyOnly(Net& currentModel,
     Net& oldModel,
     bool currentIsWhite,
     int simulationsPerMove,
@@ -6504,7 +6509,7 @@ static float playArenaGamePolicySim(Net& currentModel,
     return 0.5f;
 }
 
-static void runArenaMatchPolicySim(Net& model,
+static void runArenaMatchPolicyOnly(Net& model,
     const ModelSnapshot& oldSnapshot,
     int games,
     int simulationsPerMove) {
@@ -6523,14 +6528,14 @@ static void runArenaMatchPolicySim(Net& model,
 
     for (int g = 0; g < games; ++g) {
         bool currentIsWhite = ((g & 1) == 0);
-        float s = playArenaGamePolicySim(model, oldModel, currentIsWhite, simulationsPerMove, 256);
+        float s = playArenaGamePolicyOnly(model, oldModel, currentIsWhite, simulationsPerMove, 256);
         score += s;
         if (s > 0.75f) ++wins;
         else if (s < 0.25f) ++losses;
         else ++draws;
     }
 
-    std::cerr << "[arena] current vs old: games=" << games
+    std::cerr << "[arena-policy-only] current vs old: games=" << games
         << " sims=" << simulationsPerMove
         << " score=" << score
         << " winrate=" << (score / (float)games)
@@ -6538,31 +6543,6 @@ static void runArenaMatchPolicySim(Net& model,
 
     if (wasTraining) model->train();
 }
-
-    ModelSnapshot oldModelSnapshot = captureModelSnapshot(model);
-
-    static constexpr int MATCH_EVERY_GAMES = 10000;
-    static constexpr int MATCH_GAMES = 1000;
-    static constexpr int MATCH_SIMS_PER_MOVE = 200;
-
-    int nextMatchAt = MATCH_EVERY_GAMES;
-
-
-            if (games >= nextMatchAt) {
-                safeRefitBarrier(sp);
-                runArenaMatchPolicySim(model, oldModelSnapshot, MATCH_GAMES, MATCH_SIMS_PER_MOVE);
-                oldModelSnapshot = captureModelSnapshot(model);
-                nextMatchAt += MATCH_EVERY_GAMES;
-            }
-    // Ãàðàíòèðóåì, ÷òî íà ìîìåíò refit:
-    // - server idle
-    // - î÷åðåäü ïóñòà
-    sp.server.waitIdle();
-    sp.server.clearQueueUnsafeWhenIdle();
-}
-
-
-
 void Training(int targetGames) {
     const std::string ptFile = "net.pt";
     const std::string planFile = "net.plan";
@@ -6633,6 +6613,13 @@ void Training(int targetGames) {
     int trainBlocks = 0;
     int refits = 0;
 
+    ModelSnapshot oldModelSnapshot = captureModelSnapshot(model);
+    static constexpr int MATCH_EVERY_GAMES = 10000;
+    static constexpr int MATCH_GAMES = 1000;
+    static constexpr int MATCH_SIMS_PER_MOVE = 200;
+    // NOTE: this arena is policy-only (fast sanity-check), not full MCTS-vs-MCTS strength gating.
+    int nextMatchAt = MATCH_EVERY_GAMES;
+
     std::cout << "Íà÷èíàåì òðåíèðîâêó íà " << targetGames << " ïàðòèé...\n";
 
     while (games < targetGames) {
@@ -6658,6 +6645,13 @@ void Training(int targetGames) {
 
             ++games;
             ++gamesThisBlock;
+
+            if (games >= nextMatchAt) {
+                safeRefitBarrier(sp);
+                runArenaMatchPolicyOnly(model, oldModelSnapshot, MATCH_GAMES, MATCH_SIMS_PER_MOVE);
+                oldModelSnapshot = captureModelSnapshot(model);
+                nextMatchAt += MATCH_EVERY_GAMES;
+            }
 
             if (sp.T.abort.load(std::memory_order_relaxed)) {
                 std::cerr << "[selfplay] MCTS aborted: oomCode=" << sp.T.oomCode.load()
