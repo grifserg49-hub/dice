@@ -4867,37 +4867,22 @@ struct ReplayBuffer {
     }
 
     bool sampleBatch(std::vector<TrainSample>& out, int B, std::mt19937& rng) {
-        // 1. Изменяем размер вектора ДО захвата мьютекса.
-        // Это убирает микро-фризы (Lock Contention), позволяя Self-play потокам
-        // быстрее складывать новые партии в буфер.
-        out.resize((size_t)B);
+    out.resize((size_t)B);
+    
+    std::lock_guard<std::mutex> lk(m); // Захватили
+    if (size < (size_t)B) return false;
 
-        std::lock_guard<std::mutex> lk(m);
-        if (size < (size_t)B) return false;
-
-        // Используем непрерывное распределение [0.0, 1.0)
-        std::uniform_real_distribution<double> d(0.0, 1.0);
-
-        auto phys = [&](size_t logical) -> size_t {
-            size_t start = (head + cap - size) % cap;
-            return (start + logical) % cap;
-            };
-
-        for (int i = 0; i < B; ++i) {
-            double u = d(rng);
-
-            // 2. Математический трюк: возводим 'u' в степень < 1.0.
-            // График функции y = x^0.75 выгибается вверх. 
-            // Это значит, что случайные значения будут чаще смещаться ближе к 1.0
-            // Логический индекс 0 — самая старая позиция, (size - 1) — самая новая.
-            size_t li = (size_t)(size * std::pow(u, recent_bias));
-
-            if (li >= size) li = size - 1; // Защита от выхода за пределы
-
-            out[(size_t)i] = buf[phys(li)];
-        }
-        return true;
+    std::uniform_real_distribution<double> d(0.0, 1.0);
+    for (int i = 0; i < B; ++i) {
+        double u = d(rng);
+        size_t li = (size_t)(size * std::pow(u, recent_bias));
+        if (li >= size) li = size - 1;
+        
+        size_t start = (head + cap - size) % cap;
+        out[(size_t)i] = buf[(start + li) % cap]; // Копируем БЕЗОПАСНО внутри лока
     }
+    return true; // Отпустили
+}
 
     size_t currentSize() {
         std::lock_guard<std::mutex> lk(m);
