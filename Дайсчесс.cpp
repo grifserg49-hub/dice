@@ -6028,7 +6028,8 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
     int maxPlies,
     bool addRootNoise,
     int& outPlyCount,
-    bool& outTerminated) {
+    bool& outTerminated,
+    int& outSamplesAdded) {
     sp.resetForNewGame();
 
     Position pos;
@@ -6052,6 +6053,7 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
     sideAtSample.reserve((size_t)maxPlies);
 
     outTerminated = false;
+    outSamplesAdded = 0;
 
     for (int ply = 0; ply < maxPlies; ++ply) {
         // Early stop if table overflow
@@ -6103,8 +6105,9 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
     for (size_t i = 0; i < game.size(); ++i) {
         int stm = sideAtSample[i];
         float zi = (stm == 0) ? zWhite : (1.0f - zWhite);
-        game[i].z = 0.5*zi+0.5*game[i].q;
+        game[i].z = 0.5f * zi + 0.5f * game[i].q;
         rb.push(game[i]);
+        ++outSamplesAdded;
     }
 }
 
@@ -6784,8 +6787,8 @@ void Training(int targetGames) {
     static constexpr int SELFPLAY_BLOCK_MS = 8000;
     static constexpr int MAX_GAMES_PER_BLOCK = 16;
 
-    static constexpr int TRAIN_BLOCK_MS = 325;
-    static constexpr int TRAIN_MAX_STEPS = 9999;
+    static constexpr double REPLAY_RATIO = 6.0;          // consumed / added
+    static constexpr int TRAIN_MAX_STEPS_PER_BLOCK = 9999;
     static constexpr int TRAIN_WARMUP_BATCHES = 1000;
 
     static constexpr int REFIT_EVERY_TRAIN_BLOCKS = 8;
@@ -6793,6 +6796,12 @@ void Training(int targetGames) {
     const int simsPerPos = 800;
     const int maxPlies = 256;
     const bool addRootNoise = true;
+
+    const size_t MIN_REPLAY_TO_TRAIN =
+        (size_t)trainer.B * (size_t)TRAIN_WARMUP_BATCHES;
+
+    bool trainSchedulerActive = false;
+    double trainSampleCredits = 0.0; // measured in "samples to consume"
 
     auto t0 = std::chrono::steady_clock::now();
     auto nextSave = t0 + std::chrono::hours(1);
@@ -6818,16 +6827,29 @@ void Training(int targetGames) {
 
             int plyCount = 0;
             bool terminated = false;
+            int samplesAdded = 0;
 
             selfPlayOneGame960(sp, rb,
                 simsPerPos,
                 maxPlies,
                 addRootNoise,
                 plyCount,
-                terminated);
+                terminated,
+                samplesAdded);
 
             ++games;
             ++gamesThisBlock;
+
+            if (!trainSchedulerActive && rb.currentSize() >= MIN_REPLAY_TO_TRAIN) {
+                trainSchedulerActive = true;
+                std::cerr << "[trainer] replay warmup reached: "
+                          << rb.currentSize()
+                          << " samples, sample-based schedule enabled\n";
+            }
+
+            if (trainSchedulerActive && samplesAdded > 0) {
+                trainSampleCredits += REPLAY_RATIO * (double)samplesAdded;
+            }
 
             if (sp.T.abort.load(std::memory_order_relaxed)) {
                 std::cerr << "[selfplay] MCTS aborted: oomCode=" << sp.T.oomCode.load()
@@ -6837,17 +6859,31 @@ void Training(int targetGames) {
         }
 
         // ===========================
-        // 2) TRAIN BLOCK
+        // 2) TRAIN BLOCK (sample-based, replay ratio = 6)
         // ===========================
-        safeRefitBarrier(sp);
+        int didTrain = 0;
 
-        int didTrain = trainer.trainBlockBudgetMs(rb, model, emaModel,
-            TRAIN_BLOCK_MS,
-            TRAIN_MAX_STEPS,
-            TRAIN_WARMUP_BATCHES);
+        if (trainSchedulerActive) {
+            const int targetSteps =
+                std::min(TRAIN_MAX_STEPS_PER_BLOCK,
+                         (int)(trainSampleCredits / (double)trainer.B));
 
-        if (didTrain > 0) {
-            ++trainBlocks;
+            if (targetSteps > 0) {
+                safeRefitBarrier(sp);
+
+                // use old function as fixed-step runner by giving it a huge time budget
+                didTrain = trainer.trainBlockBudgetMs(rb, model, emaModel,
+                    /*budgetMs=*/24 * 60 * 60 * 1000,
+                    /*maxStepsHard=*/targetSteps,
+                    TRAIN_WARMUP_BATCHES);
+
+                trainSampleCredits -= (double)didTrain * (double)trainer.B;
+                if (trainSampleCredits < 0.0) trainSampleCredits = 0.0;
+
+                if (didTrain > 0) {
+                    ++trainBlocks;
+                }
+            }
         }
 
         // ===========================
@@ -6933,6 +6969,9 @@ void Training(int targetGames) {
                 << " Grad=" << trainer.lastGradNorm
                 << " nnQueue=" << sp.server.size()
                 << " refits=" << refits
+                << " sched=" << (trainSchedulerActive ? "on" : "warmup")
+                << " credits=" << trainSampleCredits
+                << " pendingSteps=" << (int)(trainSampleCredits / (double)trainer.B)
                 << "\n";
         }
     }
