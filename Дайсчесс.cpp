@@ -4511,8 +4511,8 @@ void mctsBatchedMT(Position& rootPos,
         return;
     }
 
-    const size_t nodePow2 = 1ull << 25;
-    const size_t edgeCap = 1ull << 27;
+    const size_t nodePow2 = 1ull << 21;
+    const size_t edgeCap = 1ull << 25;
 
     MCTSTable T(nodePow2, edgeCap);
 
