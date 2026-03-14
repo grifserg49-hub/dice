@@ -2805,6 +2805,24 @@ struct TrtRunner {
         return hGatherLogitsPinned + (size_t)i * (size_t)AI_MAX_MOVES;
     }
 #endif
+
+    void copyValuesTo(float* outValue, int B) const {
+        if (!outValue || B <= 0) return;
+        std::memcpy(outValue, hValuePinned, valBytes(B));
+    }
+
+#if AI_HAVE_CUDA_KERNELS
+    void copyGatherLogitsTo(float* outLogits, int B) const {
+        if (!outLogits || B <= 0) return;
+        std::memcpy(outLogits, hGatherLogitsPinned, gatherLogitsBytes(B));
+    }
+#endif
+
+    void copyPolicyTo(float* outPolicy, int B) const {
+        if (!outPolicy || B <= 0) return;
+        std::memcpy(outPolicy, hPolicyPinned,
+            (size_t)B * (size_t)POLICY_SIZE * sizeof(float));
+    }
     bool setupAuxStreams() {
         if (!engine || !ctx) return false;
 
@@ -3630,8 +3648,10 @@ static AI_FORCEINLINE int selectPUCT(const TTNode& n,
     uint32_t parentVisits,
     float parentQ,
     uint32_t rngJitter) {
-    constexpr float FPU_REDUCTION = 0.07f;
+    // value in [0..1], so c must be small
+    constexpr float FPU_C = 0.01f; // tune: 0.005f .. 0.02f
     const float sqrtN = std::sqrt((float)(parentVisits + 1u));
+    const float fpu = clamp01(parentQ - FPU_C * std::sqrt((float)parentVisits));
 
     float best = -1e30f;
     int bestI = 0;
@@ -3641,9 +3661,7 @@ static AI_FORCEINLINE int selectPUCT(const TTNode& n,
         const TTEdge& e = e0[i];
         uint32_t ev = e.visits.load(std::memory_order_relaxed);
 
-        float q;
-        if (ev) q = clamp01(e.sum() / (float)ev);
-        else    q = clamp01(parentQ - FPU_REDUCTION);
+        float q = ev ? clamp01(e.sum() / (float)ev) : fpu;
 
         float u = cpuct * e.prior() * (sqrtN / (1.0f + (float)ev));
 
@@ -3693,7 +3711,6 @@ struct PendingNN {
     Position pos;
     MoveList ml;
     Trace trace;
-    bool isRoot = false;
 };
 
 static AI_FORCEINLINE void applyVirtualLoss(TraceStep& s) {
@@ -3857,6 +3874,54 @@ static void applyRootDirichletNoiseArr(float* priors, int n) {
     renormProbsArr(priors, n);
 }
 
+struct RootNoiseBackup {
+    TTEdge* e0 = nullptr;
+    int n = 0;
+    std::array<uint16_t, AI_MAX_MOVES> priorQ{};
+};
+
+static void applyTemporaryRootNoise(MCTSTable& T,
+    const Position& rootPos,
+    bool enabled,
+    RootNoiseBackup& bk) {
+    bk.e0 = nullptr;
+    bk.n = 0;
+
+    if (!enabled) return;
+
+    TTNode* root = T.findNodeNoInsert(rootPos.key);
+    if (!root) return;
+    if (root->expanded.load(std::memory_order_acquire) != 1) return;
+    if (root->edgeCount < 2) return;
+
+    bk.e0 = T.edgePtr(root->edgeBegin);
+    bk.n = (int)root->edgeCount;
+
+    std::array<float, AI_MAX_MOVES> noisy{};
+    for (int i = 0; i < bk.n; ++i) {
+        bk.priorQ[(size_t)i] = bk.e0[i].priorRaw();
+        noisy[(size_t)i] = bk.e0[i].prior();
+    }
+
+    applyRootDirichletNoiseArr(noisy.data(), bk.n);
+
+    for (int i = 0; i < bk.n; ++i) {
+        bk.e0[i].setPrior(noisy[(size_t)i]);
+    }
+}
+
+static void restoreTemporaryRootNoise(RootNoiseBackup& bk) {
+    if (!bk.e0 || bk.n <= 0) return;
+
+    for (int i = 0; i < bk.n; ++i) {
+        bk.e0[i].setPriorRaw(bk.priorQ[(size_t)i]);
+    }
+
+    bk.e0 = nullptr;
+    bk.n = 0;
+}
+
+
 // ============================================================
 // Old expansion: policy logits in CHW [pl][sq] (4672 floats)
 // New: priors stored in std::array<float,255>, no heap.
@@ -3893,8 +3958,6 @@ static void expandLeafWithOutputs(MCTSTable& T,
     // Softmax over legal moves
     softmaxLocalArr(priors.data(), cnt);
 
-    // Optional Dirichlet noise at root
-    if (p.isRoot) applyRootDirichletNoiseArr(priors.data(), cnt);
 
     // Clamp priors, renorm, store ONCE
     for (int i = 0; i < cnt; ++i) {
@@ -3975,8 +4038,6 @@ static void expandLeafWithGatheredLogits(MCTSTable& T,
     // Softmax over legal moves
     softmaxLocalArr(priors.data(), cnt);
 
-    // Optional Dirichlet noise at root
-    if (p.isRoot) applyRootDirichletNoiseArr(priors.data(), cnt);
 
     // Clamp priors, renorm, store ONCE
     for (int i = 0; i < cnt; ++i) {
@@ -4202,7 +4263,6 @@ static void ensureRootExpanded(MCTSTable& T,
     const Position& rootPos,
     const std::array<uint64_t, 4>& path,
     const std::array<int, 64>& mask,
-    bool rootNoise,
     MoveList& ml,
     int term) {
     TTNode* root = T.getNode(rootPos.key);
@@ -4242,7 +4302,6 @@ static void ensureRootExpanded(MCTSTable& T,
     p.pos = rootPos;
     p.ml = ml;
     p.trace.reset();
-    p.isRoot = rootNoise;
 
     float v = 0.5f;
 
@@ -4270,7 +4329,6 @@ static bool runOneSim(MCTSTable& T,
     const Position& rootPos,
     const std::array<uint64_t, 4>& path,
     const std::array<int, 64>& mask,
-    bool rootNoise,
     PendingNN& outPending,
     bool& outNeedNN,
     uint32_t rngJitter) {
@@ -4358,7 +4416,6 @@ static bool runOneSim(MCTSTable& T,
             outPending.pos = pos;
             outPending.ml = ml;
             outPending.trace = tr;
-            outPending.isRoot = (isRoot && rootNoise);
             return true;
         }
 
@@ -4485,7 +4542,7 @@ void mctsBatchedMT(Position& rootPos,
         return;
     }
 
-    ensureRootExpanded(T, rootPos, path, mask, rootNoise, ml, term);
+    ensureRootExpanded(T, rootPos, path, mask, ml, term);
 
     if (T.abort.load(std::memory_order_acquire)) {
         outEvalWhite = 0.5f;
@@ -4493,6 +4550,9 @@ void mctsBatchedMT(Position& rootPos,
         outPVBeforeRoll.clear();
         return;
     }
+
+    RootNoiseBackup rootNoiseBk;
+    applyTemporaryRootNoise(T, rootPos, rootNoise, rootNoiseBk);
 
     InferenceServer nnServer(T);
     nnServer.start();
@@ -4540,7 +4600,7 @@ void mctsBatchedMT(Position& rootPos,
 
                 if (qs > 2000) continue;
 
-                bool ok = runOneSim(T, rootPos, path, mask, rootNoise,
+                bool ok = runOneSim(T, rootPos, path, mask,
                     p, needNN,
                     jitterBase + (uint32_t)k * 1337u);
 
@@ -4579,6 +4639,8 @@ void mctsBatchedMT(Position& rootPos,
 
     for (auto& th : pool) th.join();
     nnServer.stopAndDrain();
+
+    restoreTemporaryRootNoise(rootNoiseBk);
 
     float qRoot = nodeQ(*rootNode);
     outEvalWhite = (rootPos.side == 0) ? qRoot : (1.0f - qRoot);
@@ -4853,26 +4915,9 @@ static TrtRunner g_trt_old;
 static bool g_trtOldReady = false;
 static std::mutex g_trtOldMutex;
 
-// Во время обычного training/self-play active = current.
-// Во время arena временно переключаем на old/current для нужной стороны.
-static TrtRunner* g_activeTrt = &g_trt;
-static std::mutex* g_activeTrtMutex = &g_trtMutex;
-
-struct ScopedActiveBackend {
-    TrtRunner* prevTrt = nullptr;
-    std::mutex* prevMtx = nullptr;
-
-    ScopedActiveBackend(TrtRunner& trt, std::mutex& mtx) {
-        prevTrt = g_activeTrt;
-        prevMtx = g_activeTrtMutex;
-        g_activeTrt = &trt;
-        g_activeTrtMutex = &mtx;
-    }
-
-    ~ScopedActiveBackend() {
-        g_activeTrt = prevTrt;
-        g_activeTrtMutex = prevMtx;
-    }
+struct BackendBinding {
+    TrtRunner& trt;
+    std::mutex& mtx;
 };
 // Always lock BOTH in the same order, deadlock-free (C++17)
 static AI_FORCEINLINE std::scoped_lock<std::mutex, std::mutex> lockModelTrt() {
@@ -5226,6 +5271,7 @@ struct InferInFlightGuard {
 };
 struct InferenceServerTrain {
     MCTSTable& T;
+    BackendBinding backend;
 
     std::atomic<bool> stop{ false };
     std::atomic<int>  qSize{ 0 };
@@ -5234,13 +5280,14 @@ struct InferenceServerTrain {
     std::mutex m;
     std::condition_variable cv;
 
-    std::deque<PendingNN> q;   // FIFO
+    std::deque<PendingNN> q;
     std::thread th;
 
     std::vector<float> neutralPol;
     std::vector<float> neutralLogits;
 
-    explicit InferenceServerTrain(MCTSTable& tab) : T(tab) {
+    explicit InferenceServerTrain(MCTSTable& tab, BackendBinding be)
+        : T(tab), backend(be) {
         q.clear();
         neutralPol.assign((size_t)POLICY_SIZE, 0.0f);
         neutralLogits.assign((size_t)AI_MAX_MOVES, 0.0f);
@@ -5265,14 +5312,7 @@ struct InferenceServerTrain {
     void submit(PendingNN&& job) {
         {
             std::lock_guard<std::mutex> lk(m);
-
-            // Pure FIFO:
             q.emplace_back(std::move(job));
-
-            // Optional: mild root priority
-            // if (job.isRoot) q.emplace_front(std::move(job));
-            // else            q.emplace_back(std::move(job));
-
             qSize.fetch_add(1, std::memory_order_relaxed);
         }
         cv.notify_one();
@@ -5285,7 +5325,6 @@ struct InferenceServerTrain {
         }
     }
 
-    // Use only when server is idle.
     void clearQueueUnsafeWhenIdle() {
         std::lock_guard<std::mutex> lk(m);
         q.clear();
@@ -5299,7 +5338,7 @@ private:
 
         int n = 0;
         while (n < wantB && !q.empty()) {
-            batch.emplace_back(std::move(q.front())); // FIFO
+            batch.emplace_back(std::move(q.front()));
             q.pop_front();
             ++n;
         }
@@ -5309,61 +5348,114 @@ private:
 
     void run() {
         std::vector<PendingNN> batch;
+        std::vector<PendingNN> add;
         batch.reserve((size_t)TRT_MAX_BATCH);
+        add.reserve((size_t)TRT_MAX_BATCH);
 
-        for (;;) {
-            // wait for work or stop
-            {
-                std::unique_lock<std::mutex> lk(m);
-                busy.store(0, std::memory_order_relaxed);
+        std::vector<Position> posBatch;
+        posBatch.reserve((size_t)TRT_MAX_BATCH);
 
-                cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
-                    return stop.load(std::memory_order_relaxed) || !q.empty();
-                    });
+        std::vector<float> values((size_t)TRT_MAX_BATCH, 0.5f);
 
-                if (stop.load(std::memory_order_relaxed) && q.empty()) break;
-                if (q.empty()) continue;
+#if AI_HAVE_CUDA_KERNELS
+        std::vector<float> logits((size_t)TRT_MAX_BATCH * (size_t)AI_MAX_MOVES, 0.0f);
+#else
+        std::vector<float> policy((size_t)TRT_MAX_BATCH * (size_t)POLICY_SIZE, 0.0f);
+#endif
 
-                busy.store(1, std::memory_order_relaxed);
-                (void)popBatchUnlocked(batch, TRT_MAX_BATCH);
-            }
-
-            const int B = (int)batch.size();
-            if (B <= 0) continue;
+        auto processBatch = [&](std::vector<PendingNN>& jobs) {
+            const int B = (int)jobs.size();
+            if (B <= 0) return;
 
 #if AI_HAVE_CUDA_KERNELS
             bool ok = false;
             {
                 InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
-                ok = g_activeTrt->inferBatchGather(batch.data(), B);
+                std::lock_guard<std::mutex> lk(backend.mtx);
+
+                ok = backend.trt.inferBatchGather(jobs.data(), B);
+                if (ok) {
+                    backend.trt.copyValuesTo(values.data(), B);
+                    backend.trt.copyGatherLogitsTo(logits.data(), B);
+                }
             }
 
             for (int i = 0; i < B; ++i) {
-                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
-                const float* logits = ok ? g_activeTrt->gatherLogitsHostPtr(i) : neutralLogits.data();
-                expandLeafWithGatheredLogits(T, batch[(size_t)i], v, logits);
+                float v = ok ? values[(size_t)i] : 0.5f;
+                const float* lg = ok
+                    ? (logits.data() + (size_t)i * (size_t)AI_MAX_MOVES)
+                    : neutralLogits.data();
+
+                expandLeafWithGatheredLogits(T, jobs[(size_t)i], v, lg);
             }
 #else
-            std::vector<Position> posBatch((size_t)B);
-            for (int i = 0; i < B; ++i) posBatch[(size_t)i] = batch[(size_t)i].pos;
+            posBatch.clear();
+            posBatch.resize((size_t)B);
+            for (int i = 0; i < B; ++i) posBatch[(size_t)i] = jobs[(size_t)i].pos;
 
             bool ok = false;
             {
                 InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
-                ok = g_activeTrt->inferBatch(posBatch.data(), B);
+                std::lock_guard<std::mutex> lk(backend.mtx);
+
+                ok = backend.trt.inferBatch(posBatch.data(), B);
+                if (ok) {
+                    backend.trt.copyValuesTo(values.data(), B);
+                    backend.trt.copyPolicyTo(policy.data(), B);
+                }
             }
 
             for (int i = 0; i < B; ++i) {
-                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
-                const float* pol = ok ? g_activeTrt->policyHostPtr(i) : neutralPol.data();
-                expandLeafWithOutputs(T, batch[(size_t)i], v, pol);
+                float v = ok ? values[(size_t)i] : 0.5f;
+                const float* pol = ok
+                    ? (policy.data() + (size_t)i * (size_t)POLICY_SIZE)
+                    : neutralPol.data();
+
+                expandLeafWithOutputs(T, jobs[(size_t)i], v, pol);
             }
 #endif
+        };
+
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(m);
+                busy.store(0, std::memory_order_relaxed);
+
+                cv.wait(lk, [&] {
+                    return stop.load(std::memory_order_relaxed) || !q.empty();
+                });
+
+                if (stop.load(std::memory_order_relaxed) && q.empty()) break;
+
+                busy.store(1, std::memory_order_relaxed);
+                (void)popBatchUnlocked(batch, TRT_MAX_BATCH);
+            }
+
+            const auto tFillEnd =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(200);
+
+            while ((int)batch.size() < TRT_MAX_BATCH &&
+                std::chrono::steady_clock::now() < tFillEnd) {
+
+                std::unique_lock<std::mutex> lk(m);
+                if (q.empty()) {
+                    cv.wait_until(lk, tFillEnd, [&] {
+                        return stop.load(std::memory_order_relaxed) || !q.empty();
+                    });
+                }
+                if (q.empty()) break;
+
+                add.clear();
+                const int need = TRT_MAX_BATCH - (int)batch.size();
+                (void)popBatchUnlocked(add, need);
+                lk.unlock();
+
+                for (auto& j : add) batch.emplace_back(std::move(j));
+            }
+
+            processBatch(batch);
         }
 
-        // Drain remaining (best effort)
         for (;;) {
             std::vector<PendingNN> tail;
             {
@@ -5372,40 +5464,7 @@ private:
                 busy.store(1, std::memory_order_relaxed);
                 (void)popBatchUnlocked(tail, TRT_MAX_BATCH);
             }
-
-            const int B = (int)tail.size();
-            if (B <= 0) break;
-
-#if AI_HAVE_CUDA_KERNELS
-            bool ok = false;
-            {
-                InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
-                ok = g_activeTrt->inferBatchGather(tail.data(), B);
-            }
-
-            for (int i = 0; i < B; ++i) {
-                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
-                const float* logits = ok ? g_activeTrt->gatherLogitsHostPtr(i) : neutralLogits.data();
-                expandLeafWithGatheredLogits(T, tail[(size_t)i], v, logits);
-            }
-#else
-            std::vector<Position> posBatch((size_t)B);
-            for (int i = 0; i < B; ++i) posBatch[(size_t)i] = tail[(size_t)i].pos;
-
-            bool ok = false;
-            {
-                InferInFlightGuard ig;
-                std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
-                ok = g_activeTrt->inferBatch(posBatch.data(), B);
-            }
-
-            for (int i = 0; i < B; ++i) {
-                float v = ok ? g_activeTrt->valueHost(i) : 0.5f;
-                const float* pol = ok ? g_activeTrt->policyHostPtr(i) : neutralPol.data();
-                expandLeafWithOutputs(T, tail[(size_t)i], v, pol);
-            }
-#endif
+            processBatch(tail);
         }
 
         busy.store(0, std::memory_order_relaxed);
@@ -5424,7 +5483,6 @@ static AI_FORCEINLINE bool tryClaimSimBudget(std::atomic<int>& simsLeft) {
                 std::memory_order_relaxed)) {
             return true;
         }
-        // cur обновится compare_exchange_weak'ом
     }
     return false;
 }
@@ -5432,6 +5490,7 @@ static AI_FORCEINLINE bool tryClaimSimBudget(std::atomic<int>& simsLeft) {
 static AI_FORCEINLINE void refundSimBudget(std::atomic<int>& simsLeft) {
     simsLeft.fetch_add(1, std::memory_order_relaxed);
 }
+
 struct SearchPool {
     std::vector<std::thread> pool;
     std::mutex m;
@@ -5576,7 +5635,7 @@ for (;;) {
     PendingNN p;
     bool needNN = false;
 
-    bool ok = runOneSim(*TT, *rp, *pth, *msk, /*rootNoise=*/false,
+    bool ok = runOneSim(*TT, *rp, *pth, *msk,
         p, needNN,
         jitterBase + (uint32_t)(k++) * 1337u);
 
@@ -5606,10 +5665,11 @@ for (;;) {
 
 // Expand root (or any node keyed by rootPos) exactly once for training-selfplay.
 // IMPORTANT:
-//  - does NOT apply Dirichlet noise (p.isRoot = false)
+//  - does NOT apply Dirichlet noise in permanent expansion
 //  - marks GPU inference as "in flight" so trainer yields (InferInFlightGuard)
 //  - protects TensorRT with g_trtMutex
 static void ensureExpandedTrain(MCTSTable& T,
+    BackendBinding backend,
     const Position& rootPos,
     const std::array<uint64_t, 4>& path,
     const std::array<int, 64>& mask) {
@@ -5629,15 +5689,11 @@ static void ensureExpandedTrain(MCTSTable& T,
         return;
     }
 
-    // Generate legal moves for this position (note: genLegal mutates Position)
     MoveList ml;
     int term = 0;
     Position tmp = rootPos;
 
-    genLegal(tmp,
-        path,
-        mask,
-        ml, term);
+    genLegal(tmp, path, mask, ml, term);
 
     if (term) {
         root->key = rootPos.key;
@@ -5653,7 +5709,6 @@ static void ensureExpandedTrain(MCTSTable& T,
     }
 
     if (ml.n == 0) {
-        // Chance node (dice roll)
         publishReady(root, rootPos.key, 0, 0, 0, 1);
         return;
     }
@@ -5663,47 +5718,45 @@ static void ensureExpandedTrain(MCTSTable& T,
     p.pos = rootPos;
     p.ml = ml;
     p.trace.reset();
-    p.isRoot = false; // IMPORTANT: no Dirichlet noise in permanent expansion
 
     float v = 0.5f;
 
 #if AI_HAVE_CUDA_KERNELS
-    // Gathered-logits path
-    {
-        bool ok = false;
-        {
-            InferInFlightGuard ig;             // trainer yields while TRT is running
-            std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
-            ok = g_activeTrt->inferBatchGather(&p, 1);
-        }
-
-        v = ok ? g_activeTrt->valueHost(0) : 0.5f;
-
-        if (ok) {
-            const float* logits = g_activeTrt->gatherLogitsHostPtr(0);
-            expandLeafWithGatheredLogits(T, p, v, logits);
-            return;
-        }
-    }
-
-    // If TRT failed: expand with neutral logits (all zeros)
-    {
-        std::vector<float> z((size_t)AI_MAX_MOVES, 0.0f);
-        expandLeafWithGatheredLogits(T, p, v, z.data());
-    }
-#else
-    // Full-policy path (no custom kernels)
-    std::vector<float> pol((size_t)POLICY_SIZE, 0.0f);
+    std::array<float, AI_MAX_MOVES> logitsLocal{};
     bool ok = false;
+
     {
         InferInFlightGuard ig;
-        std::lock_guard<std::mutex> lk(*g_activeTrtMutex);
-        ok = g_activeTrt->inferBatch(&p.pos, 1, &v, pol.data());
+        std::lock_guard<std::mutex> lk(backend.mtx);
+
+        ok = backend.trt.inferBatchGather(&p, 1);
+        if (ok) {
+            backend.trt.copyValuesTo(&v, 1);
+            backend.trt.copyGatherLogitsTo(logitsLocal.data(), 1);
+        }
     }
+
+    if (!ok) {
+        v = 0.5f;
+        logitsLocal.fill(0.0f);
+    }
+
+    expandLeafWithGatheredLogits(T, p, v, logitsLocal.data());
+#else
+    std::vector<float> pol((size_t)POLICY_SIZE, 0.0f);
+    bool ok = false;
+
+    {
+        InferInFlightGuard ig;
+        std::lock_guard<std::mutex> lk(backend.mtx);
+        ok = backend.trt.inferBatch(&p.pos, 1, &v, pol.data());
+    }
+
     if (!ok) {
         v = 0.5f;
         std::fill(pol.begin(), pol.end(), 0.0f);
     }
+
     expandLeafWithOutputs(T, p, v, pol.data());
 #endif
 }
@@ -5806,6 +5859,7 @@ static void buildSparsePolicyTargetCHW(const Position& pos,
 static void runFixedSims(MCTSTable& T,
     SearchPool& pool,
     InferenceServerTrain& srv,
+    BackendBinding backend,
     const Position& rootPos,
     const std::array<uint64_t, 4>& path,
     const std::array<int, 64>& mask,
@@ -5813,49 +5867,17 @@ static void runFixedSims(MCTSTable& T,
     bool rootNoise) {
     if (T.abort.load(std::memory_order_relaxed)) return;
 
-    ensureExpandedTrain(T, rootPos, path, mask);
+    ensureExpandedTrain(T, backend, rootPos, path, mask);
     if (T.abort.load(std::memory_order_relaxed)) return;
 
-    TTNode* root = T.getNode(rootPos.key);
-    TTEdge* e0 = nullptr;
-    int nEdges = 0;
-
-    // Сохраняем root priors в сыром квантованном виде, чтобы потом
-    // восстановить их без лишней ошибки округления.
-    std::vector<uint16_t> savedPriorQ;
-
-    if (rootNoise &&
-        root &&
-        root->expanded.load(std::memory_order_acquire) == 1 &&
-        root->edgeCount >= 2) {
-        e0 = T.edgePtr(root->edgeBegin);
-        nEdges = (int)root->edgeCount;
-
-        savedPriorQ.resize((size_t)nEdges);
-        std::vector<float> noisy((size_t)nEdges);
-
-        for (int i = 0; i < nEdges; ++i) {
-            savedPriorQ[(size_t)i] = e0[i].priorRaw();
-            noisy[(size_t)i] = e0[i].prior();
-        }
-
-        applyRootDirichletNoise(noisy);
-
-        for (int i = 0; i < nEdges; ++i) {
-            e0[i].setPrior(noisy[(size_t)i]);
-        }
-    }
+    RootNoiseBackup rootNoiseBk;
+    applyTemporaryRootNoise(T, rootPos, rootNoise, rootNoiseBk);
 
     pool.runSims(T, srv, rootPos, path, mask, sims);
 
     srv.waitIdle();
 
-    // Восстанавливаем исходные root priors.
-    if (!savedPriorQ.empty() && e0 && nEdges > 0) {
-        for (int i = 0; i < nEdges; ++i) {
-            e0[i].setPriorRaw(savedPriorQ[(size_t)i]);
-        }
-    }
+    restoreTemporaryRootNoise(rootNoiseBk);
 }
 
 // ------------------------------------------------------------
@@ -5869,11 +5891,15 @@ static AI_FORCEINLINE void resetMCTSTableForNewGame(MCTSTable& T) {
 
 struct SelfPlayContext {
     MCTSTable T;
+    BackendBinding backend;
     InferenceServerTrain server;
     SearchPool pool;
 
-    explicit SelfPlayContext(size_t nodePow2, size_t edgeCap)
-        : T(nodePow2, edgeCap), server(T) {
+    explicit SelfPlayContext(size_t nodePow2, size_t edgeCap,
+        TrtRunner& trt, std::mutex& mtx)
+        : T(nodePow2, edgeCap)
+        , backend{ trt, mtx }
+        , server(T, backend) {
     }
 
     void start() {
@@ -5947,21 +5973,14 @@ static int playOneArenaGame(SelfPlayContext& curCtx,
         std::vector<moveState> moves;
         float q = 0.5f;
 
-        {
-            ScopedActiveBackend use(
-                currentTurn ? g_trt : g_trt_old,
-                currentTurn ? g_trtMutex : g_trtOldMutex
-            );
+        runFixedSims(ctx.T, ctx.pool, ctx.server, ctx.backend,
+            pos, path, mask, simsPerPos, /*rootNoise=*/false);
 
-            runFixedSims(ctx.T, ctx.pool, ctx.server, pos, path, mask,
-                         simsPerPos, /*rootNoise=*/false);
-
-            if (ctx.T.abort.load(std::memory_order_relaxed)) {
-                return 0;
-            }
-
-            collectRootMoves(ctx.T, pos, q, moves);
+        if (ctx.T.abort.load(std::memory_order_relaxed)) {
+            return 0;
         }
+
+        collectRootMoves(ctx.T, pos, q, moves);
 
         if (moves.empty()) return 0;
 
@@ -5977,8 +5996,8 @@ static int playOneArenaGame(SelfPlayContext& curCtx,
 static ArenaStats runArenaMatch(int games, int simsPerPos) {
     ArenaStats st;
 
-    SelfPlayContext curCtx(/*nodePow2=*/(1u << 19), /*edgeCap=*/(1u << 23));
-    SelfPlayContext oldCtx(/*nodePow2=*/(1u << 19), /*edgeCap=*/(1u << 23));
+    SelfPlayContext curCtx((1u << 19), (1u << 23), g_trt, g_trtMutex);
+    SelfPlayContext oldCtx((1u << 19), (1u << 23), g_trt_old, g_trtOldMutex);
 
     curCtx.start();
     oldCtx.start();
@@ -6086,7 +6105,8 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
 
         bool rootNoiseHere = addRootNoise && (d < 20);
 
-        runFixedSims(sp.T, sp.pool, sp.server, pos, path, mask, simsPerPos, rootNoiseHere);
+        runFixedSims(sp.T, sp.pool, sp.server, sp.backend,
+            pos, path, mask, simsPerPos, rootNoiseHere);
         if (sp.T.abort.load(std::memory_order_relaxed)) break;
 
         collectRootMoves(sp.T, pos, sample.q, moves);
@@ -6740,7 +6760,7 @@ void Training(int targetGames) {
     }
 
     // One self-play context for the whole training
-    SelfPlayContext sp(/*nodePow2=*/(1u << 20), /*edgeCap=*/(1u << 24));
+    SelfPlayContext sp((1u << 20), (1u << 24), g_trt, g_trtMutex);
     sp.start();
 
     // -------------------------------
