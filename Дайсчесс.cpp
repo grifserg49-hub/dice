@@ -3595,7 +3595,7 @@ static AI_FORCEINLINE int selectPUCT(const TTNode& n,
         uint32_t ev = e.visits.load(std::memory_order_relaxed);
         const float p = e.prior();
 
-        const float fpu = clamp01(parentQ - FPU_C * sqrtParent * p);
+const float fpu = clamp01(parentQ - 0.08f);
         const float q = ev ? clamp01((float)(e.sum() / (double)ev)) : fpu;
 
         const float u = cpuct * p * (sqrtN / (1.0f + (float)ev));
