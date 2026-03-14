@@ -7093,8 +7093,10 @@ int main() {
 
     std::cout << "slider_backend " << (g_usePext ? "pext" : "magics") << "\n";
 
-    MoveList ml;
-    genMoves(pos, path, ml);
+MoveList ml;
+int term = 0;
+Position tmp = pos;
+genLegal(tmp, path, mask, ml, term);
 
     std::cout << "moves " << ml.n << "\n";
     for (int i = 0; i < ml.n; ++i) {
