@@ -3564,75 +3564,8 @@ static AI_FORCEINLINE float toWhitePerspective(float qSideToMove, int sideToMove
     return (sideToMove == 0) ? qSideToMove : (1.0f - qSideToMove);
 }
 
-static float evalOnePVNoExpandWhite(MCTSTable& T,
-    const Position& rootPos,
-    const std::array<int, 64>& mask,
-    int maxDepth = 256) {
-    Position pos = rootPos;
 
-    for (int depth = 0; depth < maxDepth; ++depth) {
-        TTNode* n = T.findNodeNoInsert(pos.key);
-        if (!n) return 0.5f;
 
-        uint8_t ex = n->expanded.load(std::memory_order_acquire);
-        if (ex != 1) {
-            // Не ждём, не расширяем — просто используем то, что есть.
-            float q = nodeQ(*n);
-            return toWhitePerspective(q, pos.side);
-        }
-
-        if (n->terminal) {
-            // В твоей логике terminal бэкапится как v=1.0 (выигрыш side-to-move).
-            float q = 1.0f;
-            return toWhitePerspective(q, pos.side);
-        }
-
-        if (n->edgeCount == 0) {
-            if (n->chance) {
-                // Chance-узел: кидаем "кости" как в основном дереве.
-                makeRandom(pos,n);
-                continue;
-            }
-            else {
-                // Узел без ходов, но не chance: берём средний Q узла.
-                float q = nodeQ(*n);
-                return toWhitePerspective(q, pos.side);
-            }
-        }
-
-        // Decision-узел: идём по PV
-        TTEdge* e0 = T.edgePtr(n->edgeBegin);
-        int bi = selectBestPVEdge(*n, e0);
-        int m = e0[bi].move;
-
-        makeMove(pos, mask, m);
-    }
-
-    // Если упёрлись в maxDepth — оценим текущий узел как есть
-    TTNode* n = T.findNodeNoInsert(pos.key);
-    if (!n) return 0.5f;
-    float q = nodeQ(*n);
-    return toWhitePerspective(q, pos.side);
-}
-
-static float evalPVForOneSecondNoExpandWhite(MCTSTable& T,
-    const Position& rootPos,
-    const std::array<int, 64>& mask,
-    double sec = 1.0) {
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto tEnd = t0 + std::chrono::duration<double>(sec);
-
-    double sum = 0.0;
-    uint64_t cnt = 0;
-
-    while (std::chrono::steady_clock::now() < tEnd) {
-        float vW = evalOnePVNoExpandWhite(T, rootPos, mask, /*maxDepth*/256);
-        sum += (double)vW;
-        ++cnt;
-    }
-    if (!cnt) return 0.5f;
-    return (float)(sum / (double)cnt);
-}
 
 static AI_FORCEINLINE float cpuctFromVisits(uint32_t parentVisits, bool isRoot) {
     constexpr float C_INIT = 1.25f;
@@ -6658,48 +6591,13 @@ static void softmaxTo(std::vector<float>& out, const float* logits, int n) {
     for (int i = 0; i < n; ++i) out[(size_t)i] *= inv;
 }
 
-static double klDiv(const std::vector<float>& p, const std::vector<float>& q, double eps = 1e-12) {
-    // KL(p||q) with epsilon floor
-    const int n = (int)p.size();
-    double s = 0.0;
-    for (int i = 0; i < n; ++i) {
-        double pi = std::max((double)p[(size_t)i], eps);
-        double qi = std::max((double)q[(size_t)i], eps);
-        s += pi * (std::log(pi) - std::log(qi));
-    }
-    return s;
-}
-
-static double l1Dist(const std::vector<float>& p, const std::vector<float>& q) {
-    const int n = (int)p.size();
-    double s = 0.0;
-    for (int i = 0; i < n; ++i) s += std::fabs((double)p[(size_t)i] - (double)q[(size_t)i]);
-    return s;
-}
-
-static void topKIndices(const float* x, int n, int K, std::vector<int>& outIdx) {
-    outIdx.clear();
-    outIdx.reserve((size_t)K);
 
 
-    std::vector<int> idx((size_t)n);
-    for (int i = 0; i < n; ++i) idx[(size_t)i] = i;
 
-    std::partial_sort(idx.begin(), idx.begin() + std::min(K, n), idx.end(),
-        [&](int a, int b) { return x[a] > x[b]; });
 
-    int kk = std::min(K, n);
-    outIdx.assign(idx.begin(), idx.begin() + kk);
-}
 
-static int top1Index(const float* x, int n) {
-    int bi = 0;
-    float bv = x[0];
-    for (int i = 1; i < n; ++i) {
-        if (x[i] > bv) { bv = x[i]; bi = i; }
-    }
-    return bi;
-}
+
+
 
 
 static void initAllOrExit(Net& model,
