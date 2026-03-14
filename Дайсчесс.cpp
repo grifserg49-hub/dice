@@ -4930,7 +4930,14 @@ struct ReplayBuffer {
         head = (head + 1) % cap;
         if (size < cap) ++size;
     }
-
+void pushMany(const std::vector<TrainSample>& v) {
+    std::lock_guard<std::mutex> lk(m);
+    for (const auto& s : v) {
+        buf[head] = s;
+        head = (head + 1) % cap;
+        if (size < cap) ++size;
+    }
+}
     bool sampleBatch(std::vector<TrainSample>& out, int B, std::mt19937& rng) {
     out.resize((size_t)B);
 
@@ -6249,13 +6256,14 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
     }
     else return;
 
-    for (size_t i = 0; i < game.size(); ++i) {
-        int stm = sideAtSample[i];
-        float zi = (stm == 0) ? zWhite : (1.0f - zWhite);
-        game[i].z = 0.5f * zi + 0.5f * game[i].q;
-        rb.push(game[i]);
-        ++outSamplesAdded;
-    }
+for (size_t i = 0; i < game.size(); ++i) {
+    int stm = sideAtSample[i];
+    float zi = (stm == 0) ? zWhite : (1.0f - zWhite);
+    game[i].z = 0.5f * zi + 0.5f * game[i].q;
+}
+
+rb.pushMany(game);
+outSamplesAdded += (int)game.size();
 }
 
 // ------------------------------------------------------------
