@@ -21,6 +21,7 @@
 #include <memory>
 #include <deque>
 #include <torch/torch.h>
+#include <ATen/autocast_mode.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #if defined(_M_X64) || defined(_M_IX86)
@@ -6303,9 +6304,102 @@ static void emaUpdate(Net& ema, Net& src, double decay) {
 
     ema->eval();
 }
+struct CudaAutocastGuard {
+    bool enabled = false;
+    bool prevEnabled = false;
+    bool prevCacheEnabled = false;
+    at::ScalarType prevDtype = at::kFloat;
+
+    explicit CudaAutocastGuard(bool en,
+                               at::ScalarType dtype = at::kHalf,
+                               bool cacheEnabled = true)
+        : enabled(en) {
+        if (!enabled) return;
+
+        prevEnabled = at::autocast::is_autocast_enabled(at::kCUDA);
+        prevCacheEnabled = at::autocast::is_autocast_cache_enabled();
+        prevDtype = at::autocast::get_autocast_dtype(at::kCUDA);
+
+        at::autocast::increment_nesting();
+        at::autocast::set_autocast_enabled(at::kCUDA, true);
+        at::autocast::set_autocast_dtype(at::kCUDA, dtype);
+        at::autocast::set_autocast_cache_enabled(cacheEnabled);
+    }
+
+    ~CudaAutocastGuard() {
+        if (!enabled) return;
+
+        at::autocast::set_autocast_enabled(at::kCUDA, prevEnabled);
+        at::autocast::set_autocast_dtype(at::kCUDA, prevDtype);
+        at::autocast::set_autocast_cache_enabled(prevCacheEnabled);
+
+        if (at::autocast::decrement_nesting() == 0) {
+            at::autocast::clear_cache();
+        }
+    }
+};
+
+struct SimpleGradScaler {
+    bool enabled = false;
+
+    float scale = 65536.0f;
+    float growthFactor = 2.0f;
+    float backoffFactor = 0.5f;
+    int growthInterval = 2000;
+    int growthTracker = 0;
+    float minScale = 1.0f;
+
+    torch::Tensor scaleLoss(const torch::Tensor& loss) const {
+        if (!enabled) return loss;
+        return loss * scale;
+    }
+
+    bool unscaleAndCheckFinite(const std::vector<torch::Tensor>& params) {
+        if (!enabled) return true;
+
+        const float invScale = 1.0f / scale;
+        bool finite = true;
+
+        for (const auto& p : params) {
+            auto g = p.grad();
+            if (!g.defined()) continue;
+
+            g.mul_(invScale);
+
+            if (!torch::isfinite(g).all().item<bool>()) {
+                finite = false;
+            }
+        }
+        return finite;
+    }
+
+    void update(bool gradsFinite) {
+        if (!enabled) return;
+
+        if (!gradsFinite) {
+            scale = std::max(minScale, scale * backoffFactor);
+            growthTracker = 0;
+            return;
+        }
+
+        ++growthTracker;
+        if (growthTracker >= growthInterval) {
+            scale *= growthFactor;
+            growthTracker = 0;
+        }
+    }
+};
+
 struct Trainer {
     torch::Device device{ torch::kCPU };
     bool useCuda = false;
+
+    bool useAmp = false;
+    at::ScalarType ampDtype = at::kHalf;
+    SimpleGradScaler scaler;
+
+    uint64_t ampSkippedSteps = 0;
+    float lastAmpScale = 1.0f;
 
     // Hyperparams
     double initial_lr = 2e-4;
@@ -6397,6 +6491,21 @@ void init(Net& model, Net& emaModel) {
         device = torch::Device(torch::kCPU);
         useCuda = false;
     }
+
+    useAmp = useCuda;          // AMP only on CUDA
+    ampDtype = at::kHalf;      // fp16 autocast on CUDA
+
+    scaler.enabled = useAmp;
+    scaler.scale = 65536.0f;
+    scaler.growthFactor = 2.0f;
+    scaler.backoffFactor = 0.5f;
+    scaler.growthInterval = 2000;
+    scaler.growthTracker = 0;
+    scaler.minScale = 1.0f;
+    lastAmpScale = scaler.scale;
+
+    std::cerr << "[Trainer] device=" << (useCuda ? "cuda" : "cpu")
+              << " amp=" << (useAmp ? "fp16" : "off") << "\n";
 
     {
         std::lock_guard<std::mutex> lk(g_modelMutex);
@@ -6542,39 +6651,100 @@ void init(Net& model, Net& emaModel) {
             }
 
             float lossScalar = 0.0f;
-            float lossPScalar = 0.0f; // <--- ДОБАВИТЬ
-            float lossVScalar = 0.0f; // <--- ДОБАВИТЬ
+            float lossPScalar = 0.0f;
+            float lossVScalar = 0.0f;
             float gradNormScalar = 0.0f;
             bool didStep = false;
 
             {
                 std::lock_guard<std::mutex> lk(g_modelMutex);
 
-                auto out = model->forward(xDev);
-                auto pol = out.first;       // [B,73,8,8]
-                auto valLogits = out.second; // [B,1] logits in train()
+                opt->zero_grad();
 
-                auto polFlat = pol.flatten(1);                 // [B,4672]
-                auto logp = torch::log_softmax(polFlat, 1); // [B,4672]
-                auto g = logp.gather(1, idxDev);         // [B,255]
+                auto runForwardLoss = [&]() {
+                    auto out = model->forward(xDev);
+                    auto pol = out.first;         // [B,73,8,8]
+                    auto valLogits = out.second;  // [B,1]
 
-                auto lossP = -(probDev * g).sum(1).mean();
-                auto lossV = torch::binary_cross_entropy_with_logits(valLogits, zDev);
-                auto loss = lossP + lossV;
+                    // Keep numerically sensitive reductions in fp32.
+                    auto polFlat = pol.flatten(1).to(torch::kFloat32); // [B,4672]
+                    auto logp = torch::log_softmax(polFlat, 1);
+                    auto g = logp.gather(1, idxDev);                   // [B,255]
 
-                if (torch::isfinite(loss).item<bool>()) {
-                    opt->zero_grad();
-                    loss.backward();
-                    double currentGradNorm = torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+                    auto lossP = -(probDev * g).sum(1).mean();
 
-                    opt->step();
-                    emaUpdate(emaModel, model, ema_decay);
+                    auto lossV = torch::binary_cross_entropy_with_logits(
+                        valLogits.to(torch::kFloat32),
+                        zDev
+                    );
 
-                    lossScalar = loss.item<float>();
-                    lossPScalar = lossP.item<float>(); // <--- СОХРАНЯЕМ lossP
-                    lossVScalar = lossV.item<float>(); // <--- СОХРАНЯЕМ lossV
-                    gradNormScalar = static_cast<float>(currentGradNorm);
-                    didStep = true;
+                    auto loss = lossP + lossV;
+                    return std::make_tuple(loss, lossP, lossV);
+                };
+
+                torch::Tensor loss, lossP, lossV;
+
+                if (useAmp) {
+                    CudaAutocastGuard ampGuard(true, ampDtype);
+                    std::tie(loss, lossP, lossV) = runForwardLoss();
+                } else {
+                    std::tie(loss, lossP, lossV) = runForwardLoss();
+                }
+
+                const bool finiteLoss = torch::isfinite(loss).all().item<bool>();
+                if (finiteLoss) {
+                    if (useAmp) {
+                        scaler.scaleLoss(loss).backward();
+
+                        bool gradsFinite = scaler.unscaleAndCheckFinite(model->parameters());
+
+                        if (gradsFinite) {
+                            double currentGradNorm =
+                                torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+
+                            if (std::isfinite(currentGradNorm)) {
+                                opt->step();
+                                emaUpdate(emaModel, model, ema_decay);
+
+                                lossScalar = loss.item<float>();
+                                lossPScalar = lossP.item<float>();
+                                lossVScalar = lossV.item<float>();
+                                gradNormScalar = static_cast<float>(currentGradNorm);
+                                didStep = true;
+                            } else {
+                                gradsFinite = false;
+                            }
+                        }
+
+                        scaler.update(gradsFinite);
+                        lastAmpScale = scaler.scale;
+
+                        if (!didStep) {
+                            ++ampSkippedSteps;
+                        }
+                    } else {
+                        loss.backward();
+
+                        double currentGradNorm =
+                            torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+
+                        if (std::isfinite(currentGradNorm)) {
+                            opt->step();
+                            emaUpdate(emaModel, model, ema_decay);
+
+                            lossScalar = loss.item<float>();
+                            lossPScalar = lossP.item<float>();
+                            lossVScalar = lossV.item<float>();
+                            gradNormScalar = static_cast<float>(currentGradNorm);
+                            didStep = true;
+                        }
+                    }
+                } else {
+                    if (useAmp) {
+                        scaler.update(false);
+                        lastAmpScale = scaler.scale;
+                        ++ampSkippedSteps;
+                    }
                 }
             }
 
@@ -7144,6 +7314,9 @@ void Training(int targetGames) {
                 << " lastLoss=" << trainer.lastLoss
                 << " (P:" << trainer.lastLossP << " V:" << trainer.lastLossV << ")"
                 << " Grad=" << trainer.lastGradNorm
+                << " amp=" << (trainer.useAmp ? "fp16" : "off")
+                << " ampScale=" << trainer.lastAmpScale
+                << " ampSkipped=" << trainer.ampSkippedSteps
                 << " nnQueue=" << sp.server.size()
                 << " refits=" << refits
                 << " sched=" << (trainSchedulerActive ? "on" : "warmup")
