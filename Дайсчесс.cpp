@@ -6337,7 +6337,7 @@ updateLR(true);
 
                 auto lossP = -(probDev * g).sum(1).mean();
                 auto lossV = torch::binary_cross_entropy_with_logits(valLogits, zDev);
-                auto loss = lossP + 2*lossV;
+                auto loss = lossP + lossV;
 
                 if (torch::isfinite(loss).item<bool>()) {
                     opt->zero_grad();
