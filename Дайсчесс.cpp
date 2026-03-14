@@ -3561,11 +3561,6 @@ static AI_FORCEINLINE int selectBestPVEdge(const TTNode& n, const TTEdge* e0) {
     return bestI;
 }
 
-// Перевод "value для side-to-move" -> "value для белых"
-static AI_FORCEINLINE float toWhitePerspective(float qSideToMove, int sideToMove) {
-    // sideToMove: 0=white, 1=black
-    return (sideToMove == 0) ? qSideToMove : (1.0f - qSideToMove);
-}
 
 
 
@@ -6767,29 +6762,6 @@ static inline bool isFiniteF(float x) {
     return std::isfinite((double)x) != 0;
 }
 
-static void softmaxTo(std::vector<float>& out, const float* logits, int n) {
-    out.resize((size_t)n);
-    if (n <= 0) return;
-
-    float mx = logits[0];
-    for (int i = 1; i < n; ++i) mx = std::max(mx, logits[i]);
-
-    double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        double e = std::exp((double)logits[i] - (double)mx);
-        out[(size_t)i] = (float)e;
-        sum += e;
-    }
-
-    if (!(sum > 0.0)) {
-        float inv = 1.0f / (float)n;
-        for (int i = 0; i < n; ++i) out[(size_t)i] = inv;
-        return;
-    }
-
-    float inv = (float)(1.0 / sum);
-    for (int i = 0; i < n; ++i) out[(size_t)i] *= inv;
-}
 
 
 
