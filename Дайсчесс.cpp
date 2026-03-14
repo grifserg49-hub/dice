@@ -1389,8 +1389,7 @@ static void printBoardViz(const Position& pos) {
         }
         cout << " |\n";
     }
-    cout << "side " << pos.side << "\n";
-    cout << "dice " << diceIntToFen(pos.dice) << "\n";
+
 
 }
 
@@ -4395,20 +4394,76 @@ static bool runOneSim(MCTSTable& T,
         isRoot = false;
     }
 }
+static AI_FORCEINLINE char promoChar(int promo) {
+    switch (promo) {
+    case 1: return 'n';
+    case 2: return 'b';
+    case 3: return 'r';
+    case 4: return 'q';
+    default: return 0;
+    }
+}
 
+static std::string moveToStr(int move) {
+    int from = move & 63;
+    int to = (move >> 6) & 63;
+    int promo = (move >> 12) & 7;
+
+    std::string s = sqName(from) + sqName(to);
+    char pc = promoChar(promo);
+    if (pc) s.push_back(pc);
+    return s;
+}
+static void extractBestPVUntilChance(MCTSTable& T,
+    const Position& rootPos,
+    const std::array<int, 64>& mask,
+    std::vector<int>& outPV,
+    int maxDepth = 256) {
+    outPV.clear();
+
+    Position pos = rootPos;
+
+    for (int depth = 0; depth < maxDepth; ++depth) {
+        TTNode* n = T.findNodeNoInsert(pos.key);
+        if (!n) break;
+
+        uint8_t ex = n->expanded.load(std::memory_order_acquire);
+        if (ex != 1) break;
+
+        if (n->terminal) break;
+
+        // chance-узел: остановиться ДО makeRandom()
+        if (n->chance) break;
+
+        if (n->edgeCount == 0) break;
+
+        TTEdge* e0 = T.edgePtr(n->edgeBegin);
+        int bi = selectBestPVEdge(*n, e0);
+        int m = e0[bi].move;
+
+        outPV.push_back(m);
+        makeMove(pos, mask, m);
+    }
+}
 void mctsBatchedMT(Position& rootPos,
     std::array<uint64_t, 4>& path,
     std::array<int, 64>& mask,
     double timeSec,
     bool rootNoise,
     float& outEvalWhite,
-    std::vector<moveState>& outRootMoves) {
+    std::vector<moveState>& outRootMoves,
+    std::vector<int>& outPVBeforeRoll) {
     MoveList ml;
     int term;
     genLegal(rootPos, path, mask, ml, term);
+
+    outPVBeforeRoll.clear();
+
     if (term) {
         outEvalWhite = 1 - rootPos.side;
-        outRootMoves.push_back({ ml.m[0],outEvalWhite,0 });
+        outRootMoves.clear();
+        outRootMoves.push_back({ ml.m[0], outEvalWhite, 0 });
+        outPVBeforeRoll.push_back(ml.m[0]);
         return;
     }
 
@@ -4421,15 +4476,16 @@ void mctsBatchedMT(Position& rootPos,
     if (!rootNode) {
         outEvalWhite = 0.5f;
         outRootMoves.clear();
+        outPVBeforeRoll.clear();
         return;
     }
 
     ensureRootExpanded(T, rootPos, path, mask, rootNoise, ml, term);
 
-    // If overflow already happened during root expansion, stop immediately.
     if (T.abort.load(std::memory_order_acquire)) {
         outEvalWhite = 0.5f;
         outRootMoves.clear();
+        outPVBeforeRoll.clear();
         return;
     }
 
@@ -4457,7 +4513,7 @@ void mctsBatchedMT(Position& rootPos,
 
             if (nnServer.size() > 4096) {
                 static thread_local int throttleSpins2 = 0;
-                throttleOnNNQueue_NoSleep(999999, throttleSpins2); // extreme
+                throttleOnNNQueue_NoSleep(999999, throttleSpins2);
                 continue;
             }
 
@@ -4477,11 +4533,12 @@ void mctsBatchedMT(Position& rootPos,
                 int qs = nnServer.size();
                 throttleOnNNQueue_NoSleep(qs, throttleSpins);
 
-                // если очередь совсем огромная — не генерим новые leaf'ы прямо сейчас
                 if (qs > 2000) continue;
+
                 bool ok = runOneSim(T, rootPos, path, mask, rootNoise,
                     p, needNN,
                     jitterBase + (uint32_t)k * 1337u);
+
                 if (!ok) {
                     simFail.fetch_add(1, std::memory_order_relaxed);
                     if (T.abort.load(std::memory_order_relaxed)) break;
@@ -4491,7 +4548,7 @@ void mctsBatchedMT(Position& rootPos,
                 simOK.fetch_add(1, std::memory_order_relaxed);
                 if (needNN) {
                     nnExp.fetch_add(1, std::memory_order_relaxed);
-                    nnServer.submit(std::move(p));   // сразу отправили => expanded=2 будет недолго
+                    nnServer.submit(std::move(p));
                 }
             }
 
@@ -4503,7 +4560,7 @@ void mctsBatchedMT(Position& rootPos,
                 cpuRelax();
             }
         }
-        };
+    };
 
     std::vector<std::thread> pool;
     pool.reserve(threads);
@@ -4516,7 +4573,6 @@ void mctsBatchedMT(Position& rootPos,
     stop.store(true, std::memory_order_relaxed);
 
     for (auto& th : pool) th.join();
-
     nnServer.stopAndDrain();
 
     float qRoot = nodeQ(*rootNode);
@@ -4550,6 +4606,9 @@ void mctsBatchedMT(Position& rootPos,
             }
         }
     }
+
+    // NEW: вытаскиваем первую линию до броска кубиков
+    extractBestPVUntilChance(T, rootPos, mask, outPVBeforeRoll, 256);
 
     (void)simOK; (void)simFail; (void)nnExp;
 }
@@ -6057,7 +6116,7 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
     for (size_t i = 0; i < game.size(); ++i) {
         int stm = sideAtSample[i];
         float zi = (stm == 0) ? zWhite : (1.0f - zWhite);
-        game[i].z = 0.5f * zi + 0.5f * game[i].q;
+        game[i].z = 0.5*zi+0.5*game[i].q;
         rb.push(game[i]);
     }
 }
@@ -6109,6 +6168,7 @@ double   warmupStartFactor = 0.10;         // 0.05..0.25 usually good
     float lastLoss = 0.0f;
     float lastLossP = 0.0f; // <--- ДОБАВИТЬ ЭТО
     float lastLossV = 0.0f; // <--- ДОБАВИТЬ ЭТО
+    float lastGradNorm = 0.0f;
 double computeBaseLRFromSteps(uint64_t s) const {
     double lr = initial_lr;
     for (uint64_t ms : lr_milestones) {
@@ -6261,6 +6321,7 @@ updateLR(true);
             float lossScalar = 0.0f;
             float lossPScalar = 0.0f; // <--- ДОБАВИТЬ
             float lossVScalar = 0.0f; // <--- ДОБАВИТЬ
+            float gradNormScalar = 0.0f;
             bool didStep = false;
 
             {
@@ -6276,17 +6337,19 @@ updateLR(true);
 
                 auto lossP = -(probDev * g).sum(1).mean();
                 auto lossV = torch::binary_cross_entropy_with_logits(valLogits, zDev);
-                auto loss = lossP + lossV;
+                auto loss = lossP + 2*lossV;
 
                 if (torch::isfinite(loss).item<bool>()) {
                     opt->zero_grad();
                     loss.backward();
-                    torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+                    double currentGradNorm = torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+
                     opt->step();
 
                     lossScalar = loss.item<float>();
                     lossPScalar = lossP.item<float>(); // <--- СОХРАНЯЕМ lossP
                     lossVScalar = lossV.item<float>(); // <--- СОХРАНЯЕМ lossV
+                    gradNormScalar = static_cast<float>(currentGradNorm);
                     didStep = true;
                 }
             }
@@ -6298,6 +6361,7 @@ updateLR(true);
             lastLoss = lossScalar;
             lastLossP = lossPScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
             lastLossV = lossVScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
+            lastGradNorm = gradNormScalar;
             updateLR();
         }
 
@@ -6568,7 +6632,7 @@ static void initAllOrExit(Net& model,
             std::cerr << "TRT refit from net.pt failed at startup.\n";
         }
     }
-std::cerr << "[TRT] AI_HAVE_CUDA_KERNELS=" << AI_HAVE_CUDA_KERNELS << "\n";
+//std::cerr << "[TRT] AI_HAVE_CUDA_KERNELS=" << AI_HAVE_CUDA_KERNELS << "\n";
 }
 
 static void saveAll(const std::string& ptFile,
@@ -6824,6 +6888,7 @@ void Training(int targetGames) {
                 << " LR=" << trainer.current_lr
                 << " lastLoss=" << trainer.lastLoss
                 << " (P:" << trainer.lastLossP << " V:" << trainer.lastLossV << ")"
+                << " Grad=" << trainer.lastGradNorm
                 << " nnQueue=" << sp.server.size()
                 << " refits=" << refits
                 << "\n";
@@ -6948,10 +7013,11 @@ int main() {
     }
 
     float mctsEvalWhite = 0.5f;
+    std::vector<int> pvBeforeRoll;
     std::vector<moveState> rootMoves;
     bool rootNoise = false;
 
-    mctsBatchedMT(pos, path, mask, 10.0, rootNoise, mctsEvalWhite, rootMoves);
+    mctsBatchedMT(pos, path, mask, 10.0, rootNoise, mctsEvalWhite, rootMoves,pvBeforeRoll);
 
     float v = 0.5f;
     std::vector<float> pol((size_t)POLICY_SIZE, 0.0f);
@@ -6960,13 +7026,18 @@ int main() {
 
     std::cout << "eval=" << v << std::endl;
     std::cout << "mcts_eval_white " << mctsEvalWhite << "\n";
+    for (size_t i = 0; i < pvBeforeRoll.size(); ++i) {
+    if (i) std::cout << ' ';
+    std::cout << moveToStr(pvBeforeRoll[i]);
+}
+std::cout << "\n";
     std::cout << "root_moves " << rootMoves.size() << "\n";
     for (auto& ms : rootMoves) {
-        int m = ms.move;
-        std::cout << sqName(m & 63) << sqName((m >> 6) & 63)
-            << " eval " << ms.eval
-            << " visits " << ms.visits << " prior " << ms.prior << "\n";
-    }
+    std::cout << moveToStr(ms.move)
+        << " eval " << ms.eval
+        << " visits " << ms.visits
+        << " prior " << ms.prior << "\n";
+}
 
     cin.get();
 
