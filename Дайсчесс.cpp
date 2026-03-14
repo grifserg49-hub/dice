@@ -5638,7 +5638,11 @@ struct SearchPool {
     int jobId = 0;
     std::atomic<int> workersBusy{ 0 };
     std::atomic<int> simsLeft{ 0 };
+std::atomic<uint64_t> progressTick{ 0 };
 
+AI_FORCEINLINE void noteProgress() {
+    progressTick.fetch_add(1, std::memory_order_relaxed);
+}
     // job params (valid only during active job)
     MCTSTable* T = nullptr;
     InferenceServerTrain* srv = nullptr;
@@ -5718,57 +5722,117 @@ struct SearchPool {
         throw std::runtime_error("[SearchPool] FATAL: " + getFatalReason());
     }
 
-    void runSims(MCTSTable& TT,
-        InferenceServerTrain& server,
-        const Position& rp,
-        const std::array<uint64_t, 4>& pth,
-        const std::array<int, 64>& msk,
-        int sims) {
+void runSims(MCTSTable& TT,
+    InferenceServerTrain& server,
+    const Position& rp,
+    const std::array<uint64_t, 4>& pth,
+    const std::array<int, 64>& msk,
+    int sims) {
 
-        if (isFatal()) {
-            throw std::runtime_error("[SearchPool] already failed: " + getFatalReason());
-        }
-
-        if (pool.empty()) {
-            failFast("runSims() called with no worker threads", &TT);
-        }
-
-        if (TT.abort.load(std::memory_order_relaxed)) return;
-
-        simsLeft.store(sims, std::memory_order_relaxed);
-        cancelJob.store(false, std::memory_order_relaxed);
-        workersBusy.store((int)threads, std::memory_order_relaxed);
-
-        {
-            std::lock_guard<std::mutex> lk(m);
-            T = &TT;
-            srv = &server;
-            rootPos = &rp;
-            path = &pth;
-            mask = &msk;
-            ++jobId;
-        }
-        cv.notify_all();
-
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto hardTimeout = std::chrono::seconds(2);
-
-        for (;;) {
-            if (workersBusy.load(std::memory_order_relaxed) == 0) break;
-
-            if (TT.abort.load(std::memory_order_relaxed)) {
-                cancelJob.store(true, std::memory_order_relaxed);
-                simsLeft.store(0, std::memory_order_relaxed);
-            }
-
-            if (std::chrono::steady_clock::now() - t0 > hardTimeout) {
-                failFast("workers did not stop in time", &TT);
-            }
-
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
+    if (isFatal()) {
+        throw std::runtime_error("[SearchPool] already failed: " + getFatalReason());
     }
 
+    if (pool.empty()) {
+        failFast("runSims() called with no worker threads", &TT);
+    }
+
+    if (TT.abort.load(std::memory_order_relaxed)) return;
+
+    simsLeft.store(sims, std::memory_order_relaxed);
+    cancelJob.store(false, std::memory_order_relaxed);
+    workersBusy.store((int)threads, std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lk(m);
+        T = &TT;
+        srv = &server;
+        rootPos = &rp;
+        path = &pth;
+        mask = &msk;
+        ++jobId;
+    }
+    cv.notify_all();
+
+    using Clock = std::chrono::steady_clock;
+
+    // Watchdog thresholds:
+    // warning only if nothing changed for a while,
+    // fatal only if stall is really long.
+    static constexpr auto WATCHDOG_WARN_AFTER  = std::chrono::seconds(5);
+    static constexpr auto WATCHDOG_FATAL_AFTER = std::chrono::seconds(30);
+
+    uint64_t lastTick = progressTick.load(std::memory_order_relaxed);
+    int lastSimsLeft = simsLeft.load(std::memory_order_relaxed);
+    int lastQSize = server.size();
+    int lastInFlight = g_inferInFlight.load(std::memory_order_relaxed);
+
+    auto lastProgressAt = Clock::now();
+    auto lastWarnAt = Clock::time_point::min();
+
+    for (;;) {
+        const int busy = workersBusy.load(std::memory_order_relaxed);
+        if (busy == 0) break;
+
+        if (TT.abort.load(std::memory_order_relaxed)) {
+            cancelJob.store(true, std::memory_order_relaxed);
+            simsLeft.store(0, std::memory_order_relaxed);
+        }
+
+        const auto now = Clock::now();
+
+        const uint64_t tickNow = progressTick.load(std::memory_order_relaxed);
+        const int simsNow = simsLeft.load(std::memory_order_relaxed);
+        const int qNow = server.size();
+        const int inFlightNow = g_inferInFlight.load(std::memory_order_relaxed);
+
+        const bool progressed =
+            (tickNow != lastTick) ||
+            (simsNow != lastSimsLeft) ||
+            (qNow != lastQSize) ||
+            (inFlightNow != lastInFlight);
+
+        if (progressed) {
+            lastTick = tickNow;
+            lastSimsLeft = simsNow;
+            lastQSize = qNow;
+            lastInFlight = inFlightNow;
+            lastProgressAt = now;
+        } else {
+            const auto stalledFor = now - lastProgressAt;
+
+            if (stalledFor >= WATCHDOG_FATAL_AFTER) {
+                std::ostringstream oss;
+                oss << "stall watchdog fired: no progress for "
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(stalledFor).count()
+                    << " ms"
+                    << " busy=" << busy
+                    << " simsLeft=" << simsNow
+                    << " nnQueue=" << qNow
+                    << " inferInFlight=" << inFlightNow
+                    << " ttAbort=" << TT.abort.load(std::memory_order_relaxed);
+                failFast(oss.str(), &TT);
+            }
+
+            if (stalledFor >= WATCHDOG_WARN_AFTER &&
+                (lastWarnAt == Clock::time_point::min() ||
+                 now - lastWarnAt >= std::chrono::seconds(2))) {
+                lastWarnAt = now;
+                std::cerr << "[SearchPool] watchdog warning: stalled for "
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(stalledFor).count()
+                          << " ms"
+                          << " busy=" << busy
+                          << " simsLeft=" << simsNow
+                          << " nnQueue=" << qNow
+                          << " inferInFlight=" << inFlightNow
+                          << " ttAbort=" << TT.abort.load(std::memory_order_relaxed)
+                          << "\n";
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
 private:
 void workerMain(unsigned tid) {
     int myJob = 0;
@@ -5824,43 +5888,46 @@ void workerMain(unsigned tid) {
             PendingNN p;
             bool needNN = false;
 
-            bool ok = runOneSim(*TT, *rp, *pth, *msk,
-                                p, needNN,
-                                jitterBase + (uint32_t)(k++) * 1337u);
+bool ok = runOneSim(*TT, *rp, *pth, *msk,
+                    p, needNN,
+                    jitterBase + (uint32_t)(k++) * 1337u);
 
-            if (!ok) {
-                refundSimBudget(simsLeft);
+if (!ok) {
+    refundSimBudget(simsLeft);
 
-                if (fatal.load(std::memory_order_relaxed)) break;
-                if (TT->abort.load(std::memory_order_relaxed)) break;
-                if (cancelJob.load(std::memory_order_relaxed)) break;
+    if (fatal.load(std::memory_order_relaxed)) break;
+    if (TT->abort.load(std::memory_order_relaxed)) break;
+    if (cancelJob.load(std::memory_order_relaxed)) break;
 
-                cpuRelax();
-                continue;
-            }
+    cpuRelax();
+    continue;
+}
 
-            if (needNN && server) {
-                // Extra throttle right before blocking submit.
-                throttleOnNNQueue_NoSleep(server->size(), queueSpins);
+noteProgress();
 
-                if (fatal.load(std::memory_order_relaxed) ||
-                    cancelJob.load(std::memory_order_relaxed) ||
-                    TT->abort.load(std::memory_order_relaxed)) {
-                    cancelPendingNN(p);
-                    break;
-                }
+if (needNN && server) {
+    throttleOnNNQueue_NoSleep(server->size(), queueSpins);
 
-                if (!server->submit(std::move(p))) {
-                    cancelPendingNN(p);
+    if (fatal.load(std::memory_order_relaxed) ||
+        cancelJob.load(std::memory_order_relaxed) ||
+        TT->abort.load(std::memory_order_relaxed)) {
+        cancelPendingNN(p);
+        break;
+    }
 
-                    if (!fatal.load(std::memory_order_relaxed) &&
-                        !cancelJob.load(std::memory_order_relaxed) &&
-                        !TT->abort.load(std::memory_order_relaxed)) {
-                        refundSimBudget(simsLeft);
-                    }
-                    break;
-                }
-            }
+    if (!server->submit(std::move(p))) {
+        cancelPendingNN(p);
+
+        if (!fatal.load(std::memory_order_relaxed) &&
+            !cancelJob.load(std::memory_order_relaxed) &&
+            !TT->abort.load(std::memory_order_relaxed)) {
+            refundSimBudget(simsLeft);
+        }
+        break;
+    }
+
+    noteProgress();
+}
         }
 
         workersBusy.fetch_sub(1, std::memory_order_relaxed);
