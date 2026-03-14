@@ -3648,10 +3648,10 @@ static AI_FORCEINLINE int selectPUCT(const TTNode& n,
     uint32_t parentVisits,
     float parentQ,
     uint32_t rngJitter) {
-    // value in [0..1], so c must be small
-    constexpr float FPU_C = 0.01f; // tune: 0.005f .. 0.02f
+    constexpr float FPU_C = 0.01f;
+
     const float sqrtN = std::sqrt((float)(parentVisits + 1u));
-    const float fpu = clamp01(parentQ - FPU_C * std::sqrt((float)parentVisits));
+    const float sqrtParent = std::sqrt((float)parentVisits);
 
     float best = -1e30f;
     int bestI = 0;
@@ -3660,16 +3660,21 @@ static AI_FORCEINLINE int selectPUCT(const TTNode& n,
     for (int i = 0; i < cnt; ++i) {
         const TTEdge& e = e0[i];
         uint32_t ev = e.visits.load(std::memory_order_relaxed);
+        const float p = e.prior();
 
-        float q = ev ? clamp01(e.sum() / (float)ev) : fpu;
+        const float fpu = clamp01(parentQ - FPU_C * sqrtParent * p);
+        const float q = ev ? clamp01((float)(e.sum() / (double)ev)) : fpu;
 
-        float u = cpuct * e.prior() * (sqrtN / (1.0f + (float)ev));
+        const float u = cpuct * p * (sqrtN / (1.0f + (float)ev));
 
-        float jit = (float)((rngJitter + (uint32_t)i * 2654435761u) & 1023u)
+        const float jit = (float)((rngJitter + (uint32_t)i * 2654435761u) & 1023u)
             * (1.0f / 1023.0f) * 1e-6f;
 
-        float s = q + u + jit;
-        if (s > best) { best = s; bestI = i; }
+        const float s = q + u + jit;
+        if (s > best) {
+            best = s;
+            bestI = i;
+        }
     }
     (void)n;
     return bestI;
@@ -4568,8 +4573,6 @@ void mctsBatchedMT(Position& rootPos,
 
     auto worker = [&](unsigned tid) {
         uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
-        std::vector<PendingNN> pend;
-        pend.reserve((size_t)std::max(1, g_nnBatch));
 
         uint64_t iter = 0;
         for (;;) {
@@ -4586,7 +4589,7 @@ void mctsBatchedMT(Position& rootPos,
                 if (std::chrono::steady_clock::now() >= tEnd) break;
             }
 
-            pend.clear();
+            bool didUsefulWork = false;
 
             const int B = std::max(1, g_nnBatch);
             for (int k = 0; k < B; ++k) {
@@ -4610,18 +4613,16 @@ void mctsBatchedMT(Position& rootPos,
                     continue;
                 }
 
+                didUsefulWork = true;
                 simOK.fetch_add(1, std::memory_order_relaxed);
+
                 if (needNN) {
                     nnExp.fetch_add(1, std::memory_order_relaxed);
                     nnServer.submit(std::move(p));
                 }
             }
 
-            if (!pend.empty()) {
-                nnExp.fetch_add((uint64_t)pend.size(), std::memory_order_relaxed);
-                for (auto& job : pend) nnServer.submit(std::move(job));
-            }
-            else {
+            if (!didUsefulWork) {
                 cpuRelax();
             }
         }
@@ -5765,7 +5766,7 @@ static void collectRootMoves(MCTSTable& T,
     const Position& rootPos,
     float& outQSideToMove,
     std::vector<moveState>& outMoves) {
-    TTNode* root = T.getNode(rootPos.key);
+    TTNode* root = T.findNodeNoInsert(rootPos.key);
     if (!root) { outQSideToMove = 0.5f; outMoves.clear(); return; }
 
     outQSideToMove = nodeQ(*root);
@@ -5782,9 +5783,9 @@ static void collectRootMoves(MCTSTable& T,
         uint32_t v = e.visits.load(std::memory_order_relaxed);
 
         float ev = -1.0f;
-        if (v) ev = clamp01(e.sum() / (float)v);
+        if (v) ev = clamp01((float)(e.sum() / (double)v));
 
-        outMoves.push_back(moveState{ e.move, ev, (int)v });
+        outMoves.push_back(moveState{ e.move, ev, (int)v, e.prior() });
     }
 
     std::sort(outMoves.begin(), outMoves.end(),
@@ -6699,12 +6700,23 @@ static void saveAll(const std::string& ptFile,
 // Training(minutes)
 // ------------------------------------------------------------
 
+static AI_FORCEINLINE void waitForNoInferenceInFlight() {
+    while (g_inferInFlight.load(std::memory_order_acquire) != 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+
 static void safeRefitBarrier(SelfPlayContext& sp) {
-    // Гарантируем, что на момент refit:
-    // - server idle
+    // Гарантируем, что на момент refit/save:
+    // - inference server idle
     // - очередь пуста
+    // - ни один TRT inference больше не "в полёте"
     sp.server.waitIdle();
+    waitForNoInferenceInFlight();
+
     sp.server.clearQueueUnsafeWhenIdle();
+
+    waitForNoInferenceInFlight();
 }
 
 
