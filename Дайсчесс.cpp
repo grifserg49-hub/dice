@@ -3708,7 +3708,20 @@ struct PendingNN {
 };
 
 static constexpr uint16_t INVALID_POLICY_IDX = 0xFFFFu;
+static AI_FORCEINLINE float pendingPolicyLogitFromFullCHW(
+    const PendingNN& p,
+    int i,
+    const float* polChSq) {
+    const uint16_t k = p.policyIdx[(size_t)i];
 
+    if (AI_UNLIKELY(k == INVALID_POLICY_IDX || (unsigned)k >= (unsigned)POLICY_SIZE)) {
+        // Должно быть невозможно, но если mapping сломался —
+        // даём почти -inf, чтобы softmax дал ~0.
+        return -1e30f;
+    }
+
+    return polChSq[(size_t)k];
+}
 static AI_FORCEINLINE void fillPendingPolicyIdx(PendingNN& p) {
     const int n = p.ml.n;
 
@@ -3974,17 +3987,14 @@ static void expandLeafWithOutputs(MCTSTable& T,
         return;
     }
 
-    // Build priors from full policy logits (CHW)
+    // Build priors from full policy logits (CHW) using precomputed indices
     std::array<float, AI_MAX_MOVES> priors{};
     for (int i = 0; i < cnt; ++i) {
-        const int m = p.ml.m[i];
-        const int k = policyIndexCHWCanonical(m, p.pos); // 0..4671
-        priors[(size_t)i] = polChSq[(size_t)k];
+        priors[(size_t)i] = pendingPolicyLogitFromFullCHW(p, i, polChSq);
     }
 
     // Softmax over legal moves
     softmaxLocalArr(priors.data(), cnt);
-
 
     // Clamp priors, renorm, store ONCE
     for (int i = 0; i < cnt; ++i) {
@@ -4031,7 +4041,6 @@ static void expandLeafWithOutputs(MCTSTable& T,
     backprop(p.leaf, v, p.trace);
     publishReady(p.leaf, p.pos.key, begin, (uint8_t)cntU, 0, 0);
 }
-
 
 // ============================================================
 // Gathered-logits expansion: logits already in move order [0..ml.n)
