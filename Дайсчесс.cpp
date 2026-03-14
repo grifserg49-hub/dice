@@ -301,10 +301,10 @@ struct TTEdge {
         return valueSum.load(std::memory_order_relaxed);
     }
 
-    AI_FORCEINLINE void addVisitAndValue(float v) {
-        visits.fetch_add(1, std::memory_order_relaxed);
-        atomicAddDouble(valueSum, (double)v);
-    }
+   AI_FORCEINLINE void addVisitAndValue(float v) {
+    atomicAddDouble(valueSum, (double)v);
+    visits.fetch_add(1, std::memory_order_release);
+}
 };
 
 struct TTNode {
@@ -327,9 +327,9 @@ struct TTNode {
         return valueSum.load(std::memory_order_relaxed);
     }
     AI_FORCEINLINE void addVisitAndValue(float v) {
-        visits.fetch_add(1, std::memory_order_relaxed);
-        atomicAddDouble(valueSum, (double)v);
-    }
+    atomicAddDouble(valueSum, (double)v);
+    visits.fetch_add(1, std::memory_order_release);
+}
     AI_FORCEINLINE void publish(uint64_t k, uint32_t begin, uint8_t count,
         int term, int isChance) {
         key = k;
@@ -3523,14 +3523,17 @@ struct MCTSTable {
 };
 
 static AI_FORCEINLINE float nodeQ(const TTNode& n) {
-    uint32_t v = n.visits.load(std::memory_order_relaxed);
+    uint32_t v = n.visits.load(std::memory_order_acquire);
     if (!v) return 0.5f;
-    return clamp01((float)(n.sum() / (double)v));
+    double s = n.valueSum.load(std::memory_order_relaxed);
+    return clamp01((float)(s / (double)v));
 }
+
 static AI_FORCEINLINE float edgeQ(const TTEdge& e) {
-    uint32_t v = e.visits.load(std::memory_order_relaxed);
+    uint32_t v = e.visits.load(std::memory_order_acquire);
     if (!v) return -1.0f;
-    return clamp01((float)(e.sum() / (double)v));
+    double s = e.valueSum.load(std::memory_order_relaxed);
+    return clamp01((float)(s / (double)v));
 }
 
 // Выбор PV: сначала max visits, затем max Q, затем max prior.
@@ -4892,20 +4895,25 @@ struct ReplayBuffer {
 
     bool sampleBatch(std::vector<TrainSample>& out, int B, std::mt19937& rng) {
     out.resize((size_t)B);
-    
-    std::lock_guard<std::mutex> lk(m); // Захватили
-    if (size < (size_t)B) return false;
 
+    std::vector<double> biased((size_t)B);
     std::uniform_real_distribution<double> d(0.0, 1.0);
     for (int i = 0; i < B; ++i) {
-        double u = d(rng);
-        size_t li = (size_t)(size * std::pow(u, recent_bias));
-        if (li >= size) li = size - 1;
-        
-        size_t start = (head + cap - size) % cap;
-        out[(size_t)i] = buf[(start + li) % cap]; // Копируем БЕЗОПАСНО внутри лока
+        biased[(size_t)i] = std::pow(d(rng), recent_bias);
     }
-    return true; // Отпустили
+
+    std::lock_guard<std::mutex> lk(m);
+    if (size < (size_t)B) return false;
+
+    const size_t snapSize = size;
+    const size_t start = (head + cap - snapSize) % cap;
+
+    for (int i = 0; i < B; ++i) {
+        size_t li = (size_t)(biased[(size_t)i] * (double)snapSize);
+        if (li >= snapSize) li = snapSize - 1;
+        out[(size_t)i] = buf[(start + li) % cap];
+    }
+    return true;
 }
 
     size_t currentSize() {
