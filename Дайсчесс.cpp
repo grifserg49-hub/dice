@@ -2181,13 +2181,24 @@ static TrtLogger g_trtLogger;
 // ============================================================
 
 struct WeightStore {
-    std::vector<std::vector<float>> blocks;
+    std::vector<std::vector<float>> fBlocks;
+    std::vector<std::vector<int32_t>> iBlocks;
 
     nvinfer1::Weights add(std::vector<float>&& v) {
-        blocks.push_back(std::move(v));
-        auto& b = blocks.back();
+        fBlocks.push_back(std::move(v));
+        auto& b = fBlocks.back();
         nvinfer1::Weights w{};
         w.type = nvinfer1::DataType::kFLOAT;
+        w.values = b.data();
+        w.count = (int64_t)b.size();
+        return w;
+    }
+
+    nvinfer1::Weights addI32(std::vector<int32_t>&& v) {
+        iBlocks.push_back(std::move(v));
+        auto& b = iBlocks.back();
+        nvinfer1::Weights w{};
+        w.type = nvinfer1::DataType::kINT32;
         w.values = b.data();
         w.count = (int64_t)b.size();
         return w;
@@ -2198,6 +2209,13 @@ struct WeightStore {
         return add(std::move(v));
     }
 };
+
+static AI_FORCEINLINE nvinfer1::Dims dims1(int n) {
+    nvinfer1::Dims d{};
+    d.nbDims = 1;
+    d.d[0] = n;
+    return d;
+}
 
 static void fillHe(std::vector<float>& w, int fanIn, std::mt19937& rng) {
     std::normal_distribution<float> nd(0.0f, std::sqrt(2.0f / (float)fanIn));
@@ -2348,27 +2366,31 @@ static nvinfer1::ITensor* addSEBlockAffineNamed(nvinfer1::INetworkDefinition& ne
         s2 = c->getOutput(0);
     }
 
-    // IMPORTANT: EXPLICIT_BATCH => s2 is 4D: [N,2C,1,1]
-    // Slice along channel axis (dim=1)
-    // Your profile is fixed to TRT_MAX_BATCH for MIN/OPT/MAX => we can use TRT_MAX_BATCH here.
-    // If you later make batch truly dynamic, you'll need dynamic slice (shape tensors) instead.
-    const Dims4 stride{ 1,1,1,1 };
+    std::vector<int32_t> idxW((size_t)C), idxB((size_t)C);
+    for (int i = 0; i < C; ++i) {
+        idxW[(size_t)i] = i;
+        idxB[(size_t)i] = C + i;
+    }
 
-    auto* slW = net.addSlice(*s2,
-        Dims4{ 0,   0, 0, 0 },
-        Dims4{ TRT_MAX_BATCH, C, 1, 1 },
-        stride);
-    auto* slB = net.addSlice(*s2,
-        Dims4{ 0,   C, 0, 0 },
-        Dims4{ TRT_MAX_BATCH, C, 1, 1 },
-        stride);
-    if (!slW || !slB) return nullptr;
+    auto Widx = store.addI32(std::move(idxW));
+    auto Bidx = store.addI32(std::move(idxB));
 
-    slW->setName((prefix + ".se.sliceW").c_str());
-    slB->setName((prefix + ".se.sliceB").c_str());
+    auto* cW = net.addConstant(dims1(C), Widx);
+    auto* cB = net.addConstant(dims1(C), Bidx);
+    if (!cW || !cB) return nullptr;
 
-    ITensor* Wt = slW->getOutput(0); // [N,C,1,1]
-    ITensor* Bt = slB->getOutput(0); // [N,C,1,1]
+    cW->setName((prefix + ".se.idxW").c_str());
+    cB->setName((prefix + ".se.idxB").c_str());
+
+    auto* gW = net.addGather(*s2, *cW->getOutput(0), 1);
+    auto* gB = net.addGather(*s2, *cB->getOutput(0), 1);
+    if (!gW || !gB) return nullptr;
+
+    gW->setName((prefix + ".se.gatherW").c_str());
+    gB->setName((prefix + ".se.gatherB").c_str());
+
+    ITensor* Wt = gW->getOutput(0); // [N,C,1,1]
+    ITensor* Bt = gB->getOutput(0); // [N,C,1,1]
 
     ITensor* Z = addSigmoid(net, *Wt); // [N,C,1,1]
     if (!Z) return nullptr;
@@ -2476,8 +2498,8 @@ static bool buildAndSavePlan(const std::string& planFile) {
     IOptimizationProfile* prof = builder->createOptimizationProfile();
     if (!prof) return false;
 
-    prof->setDimensions("input", OptProfileSelector::kMIN, Dims4{ TRT_MAX_BATCH, NN_SQ_PLANES, 8, 8 });
-    prof->setDimensions("input", OptProfileSelector::kOPT, Dims4{ TRT_MAX_BATCH, NN_SQ_PLANES, 8, 8 });
+    prof->setDimensions("input", OptProfileSelector::kMIN, Dims4{ 1, NN_SQ_PLANES, 8, 8 });
+    prof->setDimensions("input", OptProfileSelector::kOPT, Dims4{ 64, NN_SQ_PLANES, 8, 8 });
     prof->setDimensions("input", OptProfileSelector::kMAX, Dims4{ TRT_MAX_BATCH, NN_SQ_PLANES, 8, 8 });
     if (!prof->isValid()) return false;
     if (config->addOptimizationProfile(prof) < 0) return false;
@@ -2713,6 +2735,7 @@ struct TrtRunner {
 #endif
 
     int maxBatch = TRT_MAX_BATCH;
+    int currentShapeB = -1;
 
     // Pinned host buffers
     float* hInputPinned = nullptr; // 256 * 1600
@@ -2731,24 +2754,44 @@ struct TrtRunner {
     cudaGraph_t     graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
 
-    AI_FORCEINLINE size_t inBytesFull() const {
-        return (size_t)maxBatch * (size_t)NN_INPUT_SIZE * sizeof(float);
+    AI_FORCEINLINE size_t inBytes(int B) const {
+        return (size_t)B * (size_t)NN_INPUT_SIZE * sizeof(float);
     }
-    AI_FORCEINLINE size_t polBytesFull() const {
-        return (size_t)maxBatch * (size_t)POLICY_SIZE * sizeof(float);
+    AI_FORCEINLINE size_t polBytes(int B) const {
+        return (size_t)B * (size_t)POLICY_SIZE * sizeof(float);
     }
-    AI_FORCEINLINE size_t valBytesFull() const {
-        return (size_t)maxBatch * sizeof(float);
+    AI_FORCEINLINE size_t valBytes(int B) const {
+        return (size_t)B * sizeof(float);
     }
 
 #if AI_HAVE_CUDA_KERNELS
-    AI_FORCEINLINE size_t gatherIdxBytesFull() const {
-        return (size_t)maxBatch * (size_t)AI_MAX_MOVES * sizeof(int);
+    AI_FORCEINLINE size_t gatherIdxBytes(int B) const {
+        return (size_t)B * (size_t)AI_MAX_MOVES * sizeof(int);
     }
-    AI_FORCEINLINE size_t gatherLogitsBytesFull() const {
-        return (size_t)maxBatch * (size_t)AI_MAX_MOVES * sizeof(float);
+    AI_FORCEINLINE size_t gatherLogitsBytes(int B) const {
+        return (size_t)B * (size_t)AI_MAX_MOVES * sizeof(float);
     }
 #endif
+
+    AI_FORCEINLINE size_t inBytesFull() const { return inBytes(maxBatch); }
+    AI_FORCEINLINE size_t polBytesFull() const { return polBytes(maxBatch); }
+    AI_FORCEINLINE size_t valBytesFull() const { return valBytes(maxBatch); }
+#if AI_HAVE_CUDA_KERNELS
+    AI_FORCEINLINE size_t gatherIdxBytesFull() const { return gatherIdxBytes(maxBatch); }
+    AI_FORCEINLINE size_t gatherLogitsBytesFull() const { return gatherLogitsBytes(maxBatch); }
+#endif
+
+    bool ensureShape(int B) {
+        if (!ctx) return false;
+        if (currentShapeB == B) return true;
+
+        if (!ctx->setInputShape("input", nvinfer1::Dims4{ B, NN_SQ_PLANES, 8, 8 })) {
+            std::cerr << "TensorRT: setInputShape(" << B << ",25,8,8) failed.\n";
+            return false;
+        }
+        currentShapeB = B;
+        return true;
+    }
 
     // Host accessors
     AI_FORCEINLINE const float* policyHostPtr(int i) const {
@@ -2798,6 +2841,7 @@ struct TrtRunner {
     }
     bool captureCudaGraphFixed256() {
         if (!ctx || !stream) return false;
+        if (!ensureShape(TRT_MAX_BATCH)) return false;
 
         // Ensure aux streams are attached before warmup/capture
         if (nbAuxStreams > 0 && (int)auxStreams.size() == nbAuxStreams) {
@@ -2944,9 +2988,9 @@ struct TrtRunner {
         // Profile 0 (only one)
         if (!ctx->setOptimizationProfileAsync(0, stream)) return false;
 
-        // Fixed shape
-        if (!ctx->setInputShape("input", nvinfer1::Dims4{ maxBatch, NN_SQ_PLANES, 8, 8 })) {
-            std::cerr << "TensorRT: setInputShape(256,25,8,8) failed.\n";
+        currentShapeB = -1;
+        if (!ensureShape(TRT_MAX_BATCH)) {
+            std::cerr << "TensorRT: initial setInputShape failed.\n";
             return false;
         }
 
@@ -3024,26 +3068,28 @@ struct TrtRunner {
         if (runtime) { delete runtime; runtime = nullptr; }
     }
 
-    // Fixed-batch execution. Assumes pinned buffers already filled (input, and optional gather idx).
-    bool runFixed256AndSync() {
-        if (!ctx || !stream) return false;
+    bool runBatchAndSync(int B) {
+        if (!ctx || !stream || B <= 0 || B > maxBatch) return false;
 
-        if (graphReady && graphExec) {
+        // Fast path: captured graph only for exact 256
+        if (B == TRT_MAX_BATCH && graphReady && graphExec) {
+            if (!ensureShape(TRT_MAX_BATCH)) return false;
             CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
             return true;
         }
 
-        // Ensure aux streams are set for non-graph enqueue path too
+        if (!ensureShape(B)) return false;
+
         if (nbAuxStreams > 0 && (int)auxStreams.size() == nbAuxStreams) {
             ctx->setAuxStreams(auxStreams.data(), (int32_t)auxStreams.size());
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(dInput, hInputPinned, inBytesFull(),
+        CUDA_CHECK(cudaMemcpyAsync(dInput, hInputPinned, inBytes(B),
             cudaMemcpyHostToDevice, stream));
 
 #if AI_HAVE_CUDA_KERNELS
-        CUDA_CHECK(cudaMemcpyAsync(dGatherIdx, hGatherIdxPinned, gatherIdxBytesFull(),
+        CUDA_CHECK(cudaMemcpyAsync(dGatherIdx, hGatherIdxPinned, gatherIdxBytes(B),
             cudaMemcpyHostToDevice, stream));
 #endif
 
@@ -3051,25 +3097,23 @@ struct TrtRunner {
 
 #if AI_HAVE_CUDA_KERNELS
         {
-            const int total = TRT_MAX_BATCH * AI_MAX_MOVES;
+            const int total = B * AI_MAX_MOVES;
             launchGatherPolicyKernel((const float*)dPolicy,
                 (const int*)dGatherIdx,
                 (float*)dGatherLogits,
                 total,
                 stream);
-
-            // по желанию на время отладки:
             CUDA_CHECK(cudaGetLastError());
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(hGatherLogitsPinned, dGatherLogits, gatherLogitsBytesFull(),
+        CUDA_CHECK(cudaMemcpyAsync(hGatherLogitsPinned, dGatherLogits, gatherLogitsBytes(B),
             cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(hValuePinned, dValue, valBytesFull(),
+        CUDA_CHECK(cudaMemcpyAsync(hValuePinned, dValue, valBytes(B),
             cudaMemcpyDeviceToHost, stream));
 #else
-        CUDA_CHECK(cudaMemcpyAsync(hPolicyPinned, dPolicy, polBytesFull(),
+        CUDA_CHECK(cudaMemcpyAsync(hPolicyPinned, dPolicy, polBytes(B),
             cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(hValuePinned, dValue, valBytesFull(),
+        CUDA_CHECK(cudaMemcpyAsync(hValuePinned, dValue, valBytes(B),
             cudaMemcpyDeviceToHost, stream));
 #endif
 
@@ -3088,21 +3132,11 @@ struct TrtRunner {
             positionToNNInput(posArr[i], *dst);
         }
 
-        // pad
-        if (B < maxBatch) {
-            const float* src = hInputPinned;
-            for (int i = B; i < maxBatch; ++i) {
-                std::memcpy(hInputPinned + (size_t)i * (size_t)NN_INPUT_SIZE,
-                    src, (size_t)NN_INPUT_SIZE * sizeof(float));
-            }
-        }
-
 #if AI_HAVE_CUDA_KERNELS
-        // If caller didn't provide legal-move indices, just zero them.
-        std::memset(hGatherIdxPinned, 0, gatherIdxBytesFull());
+        std::memset(hGatherIdxPinned, 0, gatherIdxBytes(B));
 #endif
 
-        bool ok = runFixed256AndSync();
+        bool ok = runBatchAndSync(B);
         if (!ok) return false;
 
         for (int i = 0; i < B; ++i) hValuePinned[(size_t)i] = clamp01(hValuePinned[(size_t)i]);
@@ -3996,7 +4030,6 @@ static void expandLeafWithGatheredLogits(MCTSTable& T,
 bool TrtRunner::inferBatchGather(const PendingNN* jobs, int B) {
     if (!ctx || B <= 0 || B > maxBatch) return false;
 
-    // 1) Encode positions into pinned input
     for (int i = 0; i < B; ++i) {
         auto* dst = reinterpret_cast<NNInput*>(
             hInputPinned + (size_t)i * (size_t)NN_INPUT_SIZE
@@ -4004,56 +4037,28 @@ bool TrtRunner::inferBatchGather(const PendingNN* jobs, int B) {
         positionToNNInput(jobs[i].pos, *dst);
     }
 
-    // 2) Pad positions (duplicate slot 0)
-    if (B < maxBatch) {
-        const float* src = hInputPinned; // slot 0
-        for (int i = B; i < maxBatch; ++i) {
-            std::memcpy(hInputPinned + (size_t)i * (size_t)NN_INPUT_SIZE,
-                src,
-                (size_t)NN_INPUT_SIZE * sizeof(float));
-        }
-    }
-
 #if AI_HAVE_CUDA_KERNELS
-    // 3) Build gather indices in move-order for each position
     for (int i = 0; i < B; ++i) {
         const MoveList& ml = jobs[i].ml;
         int* idxBase = hGatherIdxPinned + (size_t)i * (size_t)AI_MAX_MOVES;
 
-        // zero all indices (TRT gather kernel will read up to AI_MAX_MOVES)
         std::memset(idxBase, 0, (size_t)AI_MAX_MOVES * sizeof(int));
 
         const int n = ml.n;
         for (int j = 0; j < n; ++j) {
-            const int m = ml.m[j];
-            int k = policyIndexCHWCanonical(m, jobs[i].pos); // CHW: plane*64 + fromSq
-
-            // safety
+            int k = policyIndexCHWCanonical(ml.m[j], jobs[i].pos);
             if ((unsigned)k >= (unsigned)POLICY_SIZE) k = 0;
             idxBase[j] = k;
         }
     }
-
-    // 4) Pad indices too (duplicate slot 0)
-    if (B < maxBatch) {
-        const int* src = hGatherIdxPinned; // slot 0
-        for (int i = B; i < maxBatch; ++i) {
-            std::memcpy(hGatherIdxPinned + (size_t)i * (size_t)AI_MAX_MOVES,
-                src,
-                (size_t)AI_MAX_MOVES * sizeof(int));
-        }
-    }
-#else
-    // No kernels: nothing to do (fallback path uses full policy)
 #endif
 
-    // 5) Run fixed-256 execution (CUDA Graph if captured) + sync
-    bool ok = runFixed256AndSync();
+    bool ok = runBatchAndSync(B);
     if (!ok) return false;
 
-    for (int i = 0; i < B; ++i) {
+    for (int i = 0; i < B; ++i)
         hValuePinned[(size_t)i] = clamp01(hValuePinned[(size_t)i]);
-    }
+
     return true;
 }
 
@@ -4763,14 +4768,14 @@ TORCH_MODULE(Net);
 // ------------------------------------------------------------
 
 struct TrainSample {
-    std::array<float, NN_INPUT_SIZE>  x;      // [1600]
+    Position pos;
 
     // sparse policy target:
     // idx = CHW index in [0..POLICY_SIZE-1], i.e. pl*64 + sq
     uint16_t nPi = 0;
     std::array<uint16_t, AI_MAX_MOVES> piIdx{};
     std::array<float, AI_MAX_MOVES> piProb{};
-    float q;
+    float q = 0.5f;
     float z = 0.5f; // [0..1] from side-to-move perspective
 };
 
@@ -4940,15 +4945,14 @@ static bool trtRecreateContextAndRebindAndGraph(TrtRunner& trt) {
     if (!newCtx->setInputTensorAddress("input", trt.dInput)) { delete newCtx; return false; }
 
     if (!newCtx->setOptimizationProfileAsync(0, trt.stream)) { delete newCtx; return false; }
-
-    if (!newCtx->setInputShape("input", Dims4{ trt.maxBatch, NN_SQ_PLANES, 8, 8 })) {
-        std::cerr << "TensorRT: setInputShape failed on new ctx.\n";
-        delete newCtx;
-        return false;
-    }
-
     if (trt.ctx) { delete trt.ctx; trt.ctx = nullptr; }
     trt.ctx = newCtx;
+    trt.currentShapeB = -1;
+
+    if (!trt.ensureShape(TRT_MAX_BATCH)) {
+        std::cerr << "TensorRT: setInputShape failed on new ctx.\n";
+        return false;
+    }
 
     // IMPORTANT: re-attach aux streams for the NEW context BEFORE capture
     if (!trt.setupAuxStreams()) {
@@ -6089,7 +6093,7 @@ static void selfPlayOneGame960(SelfPlayContext& sp,
 
         if (moves.empty()) break;
 
-        positionToNNInput(pos, sample.x);
+        sample.pos = pos;
         buildSparsePolicyTargetCHW(pos, moves, sample.nPi, sample.piIdx, sample.piProb);
 
         game.push_back(sample);
@@ -6293,8 +6297,11 @@ updateLR(true);
             for (int i = 0; i < B; ++i) {
                 const TrainSample& s = batch[(size_t)i];
 
+                NNInput enc;
+                positionToNNInput(s.pos, enc);
+
                 std::memcpy(xp + (size_t)i * (size_t)NN_INPUT_SIZE,
-                    s.x.data(),
+                    enc.data(),
                     (size_t)NN_INPUT_SIZE * sizeof(float));
 
                 // sparse policy target packed into fixed 255 slots (rest are already 0 in samples)
