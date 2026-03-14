@@ -2878,7 +2878,7 @@ struct TrtRunner {
         std::memset(hInputPinned, 0, inBytesFull());
         std::memset(hValuePinned, 0, valBytesFull());
 #if AI_HAVE_CUDA_KERNELS
-        std::memset(hGatherIdxPinned, 0, gatherIdxBytesFull());
+        std::fill_n(hGatherIdxPinned, (size_t)TRT_MAX_BATCH * (size_t)AI_MAX_MOVES, -1);
         std::memset(hGatherLogitsPinned, 0, gatherLogitsBytesFull());
 #endif
 
@@ -3151,7 +3151,7 @@ struct TrtRunner {
         }
 
 #if AI_HAVE_CUDA_KERNELS
-        std::memset(hGatherIdxPinned, 0, gatherIdxBytes(B));
+        std::fill_n(hGatherIdxPinned, (size_t)B * (size_t)AI_MAX_MOVES, -1);
 #endif
 
         bool ok = runBatchAndSync(B);
@@ -4108,13 +4108,12 @@ bool TrtRunner::inferBatchGather(const PendingNN* jobs, int B) {
         const MoveList& ml = jobs[i].ml;
         int* idxBase = hGatherIdxPinned + (size_t)i * (size_t)AI_MAX_MOVES;
 
-        std::memset(idxBase, 0, (size_t)AI_MAX_MOVES * sizeof(int));
+        std::fill_n(idxBase, AI_MAX_MOVES, -1);
 
         const int n = ml.n;
         for (int j = 0; j < n; ++j) {
             int k = policyIndexCHWCanonical(ml.m[j], jobs[i].pos);
-            if ((unsigned)k >= (unsigned)POLICY_SIZE) k = 0;
-            idxBase[j] = k;
+            idxBase[j] = ((unsigned)k < (unsigned)POLICY_SIZE) ? k : -1;
         }
     }
 #endif
