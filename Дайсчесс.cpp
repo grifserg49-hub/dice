@@ -4638,60 +4638,76 @@ void mctsBatchedMT(Position& rootPos,
     std::atomic<bool> stop{ false };
     std::atomic<uint64_t> simOK{ 0 }, simFail{ 0 }, nnExp{ 0 };
 
-    auto worker = [&](unsigned tid) {
-        uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
+auto worker = [&](unsigned tid) {
+    uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
 
-        uint64_t iter = 0;
-        for (;;) {
-            if (stop.load(std::memory_order_relaxed)) break;
+    uint64_t iter = 0;
+    int queueSpins = 0;
+
+    for (;;) {
+        if (stop.load(std::memory_order_relaxed)) break;
+        if (T.abort.load(std::memory_order_relaxed)) break;
+
+        if ((iter++ & 63ull) == 0ull) {
+            if (std::chrono::steady_clock::now() >= tEnd) break;
+        }
+
+        bool didUsefulWork = false;
+
+        const int B = std::max(1, g_nnBatch);
+        for (int k = 0; k < B; ++k) {
             if (T.abort.load(std::memory_order_relaxed)) break;
+            if (stop.load(std::memory_order_relaxed)) break;
 
-            
+            // Front-pressure: let NN server drain before making more leaves.
+            throttleOnNNQueue_NoSleep(nnServer.size(), queueSpins);
 
-            if ((iter++ & 63ull) == 0ull) {
-                if (std::chrono::steady_clock::now() >= tEnd) break;
+            if (T.abort.load(std::memory_order_relaxed)) break;
+            if (stop.load(std::memory_order_relaxed)) break;
+
+            PendingNN p;
+            bool needNN = false;
+
+            bool ok = runOneSim(T, rootPos, path, mask,
+                                p, needNN,
+                                jitterBase + (uint32_t)k * 1337u);
+
+            if (!ok) {
+                simFail.fetch_add(1, std::memory_order_relaxed);
+                if (T.abort.load(std::memory_order_relaxed)) break;
+                continue;
             }
 
-            bool didUsefulWork = false;
+            didUsefulWork = true;
+            simOK.fetch_add(1, std::memory_order_relaxed);
 
-            const int B = std::max(1, g_nnBatch);
-            for (int k = 0; k < B; ++k) {
-                if (T.abort.load(std::memory_order_relaxed)) break;
+            if (needNN) {
+                nnExp.fetch_add(1, std::memory_order_relaxed);
 
-                PendingNN p;
-                bool needNN = false;
-                
+                // Extra throttle immediately before submit.
+                throttleOnNNQueue_NoSleep(nnServer.size(), queueSpins);
 
-                bool ok = runOneSim(T, rootPos, path, mask,
-                    p, needNN,
-                    jitterBase + (uint32_t)k * 1337u);
+                if (stop.load(std::memory_order_relaxed) ||
+                    T.abort.load(std::memory_order_relaxed)) {
+                    cancelPendingNN(p);
+                    simFail.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
 
-                if (!ok) {
+                if (!nnServer.submit(std::move(p))) {
+                    cancelPendingNN(p);
                     simFail.fetch_add(1, std::memory_order_relaxed);
                     if (T.abort.load(std::memory_order_relaxed)) break;
                     continue;
                 }
-
-                didUsefulWork = true;
-                simOK.fetch_add(1, std::memory_order_relaxed);
-
-                if (needNN) {
-                    nnExp.fetch_add(1, std::memory_order_relaxed);
-
-                    if (!nnServer.submit(std::move(p))) {
-                        cancelPendingNN(p);
-                        simFail.fetch_add(1, std::memory_order_relaxed);
-                        if (T.abort.load(std::memory_order_relaxed)) break;
-                        continue;
-                    }
-                }
-            }
-
-            if (!didUsefulWork) {
-                cpuRelax();
             }
         }
-    };
+
+        if (!didUsefulWork) {
+            cpuRelax();
+        }
+    }
+};
 
     std::vector<std::thread> pool;
     pool.reserve(threads);
@@ -5754,88 +5770,102 @@ struct SearchPool {
     }
 
 private:
-    void workerMain(unsigned tid) {
-        int myJob = 0;
-        uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
+void workerMain(unsigned tid) {
+    int myJob = 0;
+    uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
+
+    for (;;) {
+        MCTSTable* TT = nullptr;
+        InferenceServerTrain* server = nullptr;
+        const Position* rp = nullptr;
+        const std::array<uint64_t, 4>* pth = nullptr;
+        const std::array<int, 64>* msk = nullptr;
+
+        {
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait(lk, [&] {
+                return stop || jobId != myJob;
+            });
+
+            if (stop) return;
+
+            myJob = jobId;
+            TT = T;
+            server = srv;
+            rp = rootPos;
+            pth = path;
+            msk = mask;
+        }
+
+        if (!TT || TT->abort.load(std::memory_order_relaxed)) {
+            workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        int k = 0;
+        int queueSpins = 0;
 
         for (;;) {
-            MCTSTable* TT = nullptr;
-            InferenceServerTrain* server = nullptr;
-            const Position* rp = nullptr;
-            const std::array<uint64_t, 4>* pth = nullptr;
-            const std::array<int, 64>* msk = nullptr;
+            if (fatal.load(std::memory_order_relaxed)) break;
+            if (TT->abort.load(std::memory_order_relaxed)) break;
+            if (cancelJob.load(std::memory_order_relaxed)) break;
 
-            {
-                std::unique_lock<std::mutex> lk(m);
-                cv.wait(lk, [&] {
-                    return stop || jobId != myJob;
-                });
+            // Front-pressure: don't create more NN work while queue is overloaded.
+            if (server) {
+                throttleOnNNQueue_NoSleep(server->size(), queueSpins);
 
-                if (stop) return;
-
-                myJob = jobId;
-                TT = T;
-                server = srv;
-                rp = rootPos;
-                pth = path;
-                msk = mask;
+                if (fatal.load(std::memory_order_relaxed)) break;
+                if (TT->abort.load(std::memory_order_relaxed)) break;
+                if (cancelJob.load(std::memory_order_relaxed)) break;
             }
 
-            if (!TT || TT->abort.load(std::memory_order_relaxed)) {
-                workersBusy.fetch_sub(1, std::memory_order_relaxed);
-                continue;
-            }
+            if (!tryClaimSimBudget(simsLeft)) break;
 
-            int k = 0;
-            for (;;) {
+            PendingNN p;
+            bool needNN = false;
+
+            bool ok = runOneSim(*TT, *rp, *pth, *msk,
+                                p, needNN,
+                                jitterBase + (uint32_t)(k++) * 1337u);
+
+            if (!ok) {
+                refundSimBudget(simsLeft);
+
                 if (fatal.load(std::memory_order_relaxed)) break;
                 if (TT->abort.load(std::memory_order_relaxed)) break;
                 if (cancelJob.load(std::memory_order_relaxed)) break;
 
-                if (!tryClaimSimBudget(simsLeft)) break;
-
-                PendingNN p;
-                bool needNN = false;
-
-                bool ok = runOneSim(*TT, *rp, *pth, *msk,
-                                    p, needNN,
-                                    jitterBase + (uint32_t)(k++) * 1337u);
-
-                if (!ok) {
-                    refundSimBudget(simsLeft);
-
-                    if (fatal.load(std::memory_order_relaxed)) break;
-                    if (TT->abort.load(std::memory_order_relaxed)) break;
-                    if (cancelJob.load(std::memory_order_relaxed)) break;
-
-                    cpuRelax();
-                    continue;
-                }
-
-                if (needNN && server) {
-                    if (fatal.load(std::memory_order_relaxed) ||
-                        cancelJob.load(std::memory_order_relaxed) ||
-                        TT->abort.load(std::memory_order_relaxed)) {
-                        cancelPendingNN(p);
-                        break;
-                    }
-
-                    if (!server->submit(std::move(p))) {
-                        cancelPendingNN(p);
-
-                        if (!fatal.load(std::memory_order_relaxed) &&
-                            !cancelJob.load(std::memory_order_relaxed) &&
-                            !TT->abort.load(std::memory_order_relaxed)) {
-                            refundSimBudget(simsLeft);
-                        }
-                        break;
-                    }
-                }
+                cpuRelax();
+                continue;
             }
 
-            workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            if (needNN && server) {
+                // Extra throttle right before blocking submit.
+                throttleOnNNQueue_NoSleep(server->size(), queueSpins);
+
+                if (fatal.load(std::memory_order_relaxed) ||
+                    cancelJob.load(std::memory_order_relaxed) ||
+                    TT->abort.load(std::memory_order_relaxed)) {
+                    cancelPendingNN(p);
+                    break;
+                }
+
+                if (!server->submit(std::move(p))) {
+                    cancelPendingNN(p);
+
+                    if (!fatal.load(std::memory_order_relaxed) &&
+                        !cancelJob.load(std::memory_order_relaxed) &&
+                        !TT->abort.load(std::memory_order_relaxed)) {
+                        refundSimBudget(simsLeft);
+                    }
+                    break;
+                }
+            }
         }
+
+        workersBusy.fetch_sub(1, std::memory_order_relaxed);
     }
+}
 };
 
 // ------------------------------------------------------------
