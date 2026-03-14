@@ -6165,6 +6165,7 @@ struct Trainer {
     double initial_lr = 2e-4;
     double current_lr = initial_lr;
     double wd = 1e-4;
+    double ema_decay = 0.999;
 // restart-warmup
 uint64_t resumeStartStep = 0;              // step at process start / resume
 uint64_t warmupStepsAfterRestart = 2000;   // tune: 1000..5000
@@ -6228,7 +6229,7 @@ double computeRestartWarmupMultiplier(uint64_t s) const {
     }
 }
 
-    void init(Net& model) {
+    void init(Net& model, Net& emaModel) {
         // Stop libtorch from stealing CPU threads
         try { torch::set_num_threads(1); }
         catch (...) {}
@@ -6253,6 +6254,9 @@ double computeRestartWarmupMultiplier(uint64_t s) const {
             std::lock_guard<std::mutex> lk(g_modelMutex);
             model->to(device);
             model->train();
+
+            emaModel->to(device);
+            emaModel->eval();
         }
 
         opt = std::make_unique<torch::optim::AdamW>(
@@ -6286,7 +6290,7 @@ updateLR(true);
     }
 
     // Train block with a strict time budget.
-    int trainBlockBudgetMs(ReplayBuffer& rb, Net& model,
+    int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
         int budgetMs,
         int maxStepsHard,
     int warmupBatches = 1000) {
@@ -6373,6 +6377,7 @@ updateLR(true);
                     double currentGradNorm = torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
 
                     opt->step();
+                    emaUpdate(emaModel, model, ema_decay);
 
                     lossScalar = loss.item<float>();
                     lossPScalar = lossP.item<float>(); // <--- СОХРАНЯЕМ lossP
@@ -6509,6 +6514,59 @@ static void copyNetState(Net& dst, Net& src) {
     else                    dst->eval();
 }
 
+static bool loadOrCreateEmaModel(const std::string& emaFile, Net& emaModel, Net& model) {
+    if (fileExists(emaFile)) {
+        try {
+            torch::load(emaModel, emaFile);
+            emaModel->eval();
+            return true;
+        }
+        catch (const std::exception& e) {
+            std::cerr << "torch::load(ema) failed: " << e.what()
+                      << " -> fallback to current model\n";
+        }
+    }
+
+    try {
+        copyNetState(emaModel, model);
+        emaModel->eval();
+        torch::save(emaModel, emaFile);
+        return true;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "create/save ema model failed: " << e.what() << "\n";
+        return false;
+    }
+}
+
+static void emaUpdate(Net& ema, Net& src, double decay) {
+    torch::NoGradGuard ng;
+
+    auto srcParams = src->named_parameters(true);
+    auto emaParams = ema->named_parameters(true);
+
+    for (const auto& kv : srcParams) {
+        auto* e = emaParams.find(kv.key());
+        if (!e) continue;
+
+        auto s = kv.value().detach().to(e->device(), e->scalar_type());
+        e->mul_(decay);
+        e->add_(s, 1.0 - decay);
+    }
+
+    auto srcBufs = src->named_buffers(true);
+    auto emaBufs = ema->named_buffers(true);
+
+    for (const auto& kv : srcBufs) {
+        auto* e = emaBufs.find(kv.key());
+        if (!e) continue;
+
+        e->copy_(kv.value().detach().to(e->device(), e->scalar_type()));
+    }
+
+    ema->eval();
+}
+
 static bool ensureOldRunnerReady(const std::string& planFile) {
     std::lock_guard<std::mutex> lk(g_trtOldMutex);
     if (g_trtOldReady) return true;
@@ -6518,19 +6576,19 @@ static bool ensureOldRunnerReady(const std::string& planFile) {
     return true;
 }
 
-static bool syncCurrentRunnerFromModel(Net& model) {
+static bool syncCurrentRunnerFromModel(Net& emaModel) {
     std::scoped_lock lk(g_modelMutex, g_trtMutex);
     torch::NoGradGuard ng;
-    return trtRefitFromTorchModel(g_trt, model);
+    return trtRefitFromTorchModel(g_trt, emaModel);
 }
 
-static bool snapshotCurrentIntoOld(Net& currentModel,
+static bool snapshotCurrentIntoOld(Net& currentEmaModel,
                                    Net& oldModel,
                                    const std::string& planFile) {
     {
         std::lock_guard<std::mutex> lk(g_modelMutex);
         oldModel->to(torch::kCPU);
-        copyNetState(oldModel, currentModel);
+        copyNetState(oldModel, currentEmaModel);
         oldModel->eval();
     }
 
@@ -6616,7 +6674,9 @@ static int top1Index(const float* x, int n) {
 
 
 static void initAllOrExit(Net& model,
+    Net& emaModel,
     const std::string& ptFile,
+    const std::string& emaFile,
     const std::string& planFile) {
     setlocale(LC_ALL, "Russian");
 
@@ -6641,6 +6701,11 @@ static void initAllOrExit(Net& model,
         std::exit(1);
     }
 
+    if (!loadOrCreateEmaModel(emaFile, emaModel, model)) {
+        std::cerr << "Не удалось загрузить/создать " << emaFile << "\n";
+        std::exit(1);
+    }
+
     {
         std::lock_guard<std::mutex> lk(g_trtMutex);
         if (!g_trt.initOrCreate(planFile)) {
@@ -6656,18 +6721,20 @@ static void initAllOrExit(Net& model,
         std::scoped_lock lk(g_modelMutex, g_trtMutex);
         torch::NoGradGuard ng;
 
-        if (!trtRefitFromTorchModel(g_trt, model)) {
-            std::cerr << "TRT refit from net.pt failed at startup.\n";
+        if (!trtRefitFromTorchModel(g_trt, emaModel)) {
+            std::cerr << "TRT refit from net_ema.pt failed at startup.\n";
         }
     }
 //std::cerr << "[TRT] AI_HAVE_CUDA_KERNELS=" << AI_HAVE_CUDA_KERNELS << "\n";
 }
 
 static void saveAll(const std::string& ptFile,
+    const std::string& emaFile,
     const std::string& planFile,
     const std::string& optFile,
     const std::string& trainerStateFile,
     Net& model,
+    Net& emaModel,
     Trainer& trainer) {
     {
         std::lock_guard<std::mutex> lk(g_modelMutex);
@@ -6677,6 +6744,13 @@ static void saveAll(const std::string& ptFile,
         }
         catch (const std::exception& e) {
             std::cerr << "torch::save(model) failed: " << e.what() << "\n";
+        }
+
+        try {
+            torch::save(emaModel, emaFile);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "torch::save(emaModel) failed: " << e.what() << "\n";
         }
 
         if (!saveOptimizerState(optFile, trainer)) {
@@ -6723,12 +6797,14 @@ static void safeRefitBarrier(SelfPlayContext& sp) {
 
 void Training(int targetGames) {
     const std::string ptFile = "net.pt";
+    const std::string emaFile = "net_ema.pt";
     const std::string planFile = "net.plan";
     const std::string optFile = "optimizer.pt";
     const std::string trainerStateFile = "trainer_state.bin";
 
     Net model;
-    initAllOrExit(model, ptFile, planFile);
+    Net emaModel;
+    initAllOrExit(model, emaModel, ptFile, emaFile, planFile);
 
     // Replay
     static constexpr size_t REPLAY_CAP = 1000000;
@@ -6744,7 +6820,7 @@ void Training(int targetGames) {
         std::cerr << "[Trainer] no trainer_state found, starting from step 0.\n";
     }
 
-    trainer.init(model);
+    trainer.init(model, emaModel);
 
     if (loadOptimizerState(optFile, trainer)) {
         std::cerr << "[Trainer] optimizer state restored.\n";
@@ -6767,7 +6843,7 @@ void Training(int targetGames) {
     oldModel->to(torch::kCPU);
     oldModel->eval();
 
-    if (!snapshotCurrentIntoOld(model, oldModel, planFile)) {
+    if (!snapshotCurrentIntoOld(emaModel, oldModel, planFile)) {
         std::cerr << "[arena] failed to initialize old snapshot in memory.\n";
     }
 
@@ -6838,7 +6914,7 @@ void Training(int targetGames) {
         // ===========================
         safeRefitBarrier(sp);
 
-        int didTrain = trainer.trainBlockBudgetMs(rb, model,
+        int didTrain = trainer.trainBlockBudgetMs(rb, model, emaModel,
             TRAIN_BLOCK_MS,
             TRAIN_MAX_STEPS,
             TRAIN_WARMUP_BATCHES);
@@ -6856,7 +6932,7 @@ void Training(int targetGames) {
             std::scoped_lock lk(g_modelMutex, g_trtMutex);
             torch::NoGradGuard ng;
 
-            if (!trtRefitFromTorchModel(g_trt, model)) {
+            if (!trtRefitFromTorchModel(g_trt, emaModel)) {
                 std::cerr << "[refit] TRT refit failed.\n";
             }
             else {
@@ -6868,13 +6944,13 @@ void Training(int targetGames) {
             safeRefitBarrier(sp);
 
             // current TRT должен точно соответствовать текущему model
-            if (!syncCurrentRunnerFromModel(model)) {
-                std::cerr << "[arena] failed to sync current TRT from model.\n";
+            if (!syncCurrentRunnerFromModel(emaModel)) {
+                std::cerr << "[arena] failed to sync current TRT from EMA model.\n";
                 break;
             }
 
             if (!g_trtOldReady) {
-                if (!snapshotCurrentIntoOld(model, oldModel, planFile)) {
+                if (!snapshotCurrentIntoOld(emaModel, oldModel, planFile)) {
                     std::cerr << "[arena] failed to prepare old TRT snapshot.\n";
                     break;
                 }
@@ -6891,8 +6967,8 @@ void Training(int targetGames) {
 
             // promotion rule: если current > old, old := current
             if (ar.currentScore() > 0.5) {
-                if (snapshotCurrentIntoOld(model, oldModel, planFile)) {
-                    std::cout << "[arena] promoted current -> old snapshot in memory\n";
+                if (snapshotCurrentIntoOld(emaModel, oldModel, planFile)) {
+                    std::cout << "[arena] promoted current EMA -> old snapshot in memory\n";
                 }
                 else {
                     std::cerr << "[arena] promotion failed\n";
@@ -6914,7 +6990,7 @@ void Training(int targetGames) {
             safeRefitBarrier(sp);
             nextSave += std::chrono::hours(1);
 
-            saveAll(ptFile, planFile, optFile, trainerStateFile, model, trainer);
+            saveAll(ptFile, emaFile, planFile, optFile, trainerStateFile, model, emaModel, trainer);
 
             std::cout << "[autosave] Прогресс: " << games << " / " << targetGames << " партий.\n";
         }
@@ -6949,6 +7025,13 @@ void Training(int targetGames) {
         }
         catch (const std::exception& e) {
             std::cerr << "torch::save(model) failed: " << e.what() << "\n";
+        }
+
+        try {
+            torch::save(emaModel, emaFile);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "torch::save(emaModel) failed: " << e.what() << "\n";
         }
 
         if (!saveOptimizerState(optFile, trainer)) {
@@ -6986,7 +7069,7 @@ void Training(int targetGames) {
             std::scoped_lock lk(g_modelMutex, g_trtMutex);
             torch::NoGradGuard ng;
 
-            if (trtRefitFromTorchModel(g_trt, model)) {
+            if (trtRefitFromTorchModel(g_trt, emaModel)) {
                 trtSavePlanToDisk(g_trt, planFile);
             }
         }
@@ -7005,13 +7088,14 @@ void Training(int targetGames) {
         g_trtOldReady = false;
     }
 
-    std::cout << "Тренировка успешно завершена! Файлы net.pt, optimizer.pt, trainer_state.bin и net.plan готовы.\n";
+    std::cout << "Тренировка успешно завершена! Файлы net.pt, net_ema.pt, optimizer.pt, trainer_state.bin и net.plan готовы.\n";
 }
 
 
 
 int main() {
     const std::string ptFile = "net.pt";
+    const std::string emaFile = "net_ema.pt";
     const std::string planFile = "net.plan";
 
     std::cout << "Введите FEN (или '960' для случайной Chess960 позиции, '-' для Training):\n";
@@ -7027,7 +7111,8 @@ int main() {
     }
 
     Net model;
-    initAllOrExit(model, ptFile, planFile);
+    Net emaModel;
+    initAllOrExit(model, emaModel, ptFile, emaFile, planFile);
     if (!g_trtReady) {
         std::cout << "TensorRT движок не загружен.\n";
         return 1;
