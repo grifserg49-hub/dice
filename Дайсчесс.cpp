@@ -3678,14 +3678,23 @@ struct Trace {
         }
     }
 
-    AI_FORCEINLINE TraceStep& push(TTNode* node, TTEdge* edge, bool flip, bool vloss) {
-        if (n >= MCTS_MAX_DEPTH) {
-            st[MCTS_MAX_DEPTH - 1] = { node, edge, flip, false };
-            return st[MCTS_MAX_DEPTH - 1];
-        }
-        st[n] = { node, edge, flip, vloss };
-        return st[n++];
+AI_FORCEINLINE TraceStep& push(TTNode* node, TTEdge* edge, bool flip, bool vloss) {
+    assert(n >= 0 && n < MCTS_MAX_DEPTH);
+
+    if (AI_UNLIKELY((unsigned)n >= (unsigned)MCTS_MAX_DEPTH)) {
+        std::cerr << "[FATAL] Trace overflow: n=" << n
+                  << " MCTS_MAX_DEPTH=" << MCTS_MAX_DEPTH << "\n";
+        std::abort();
     }
+
+    TraceStep& s = st[n];
+    s.node = node;
+    s.edge = edge;
+    s.flip = flip;
+    s.vloss = vloss;
+    ++n;
+    return s;
+}
 };
 
 struct PendingNN {
