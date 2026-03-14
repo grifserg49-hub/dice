@@ -3368,8 +3368,12 @@ struct MCTSTable {
         const uint32_t wantTag = makeTag32(key);
 
         uint64_t idx = key & mask;
-
         int probe = 0;
+
+        using Clock = std::chrono::steady_clock;
+        const auto waitBudget = std::chrono::microseconds(AI_LOCK_WAIT_US);
+        Clock::time_point lockStart{};
+        uint64_t lockStartIdx = ~0ull;
         int lockSpins = 0;
 
         while (probe < PROBE_LIMIT) {
@@ -3379,7 +3383,7 @@ struct MCTSTable {
             const uint32_t mg = metaGen(m);
             const uint32_t mt = metaTag(m);
 
-            // Slot from older generation => treat as empty; try to claim it
+            // older generation => treat as empty, try to claim
             if (AI_UNLIKELY(mg != g)) {
                 uint64_t expected = m;
                 const uint64_t lockedMeta = packMeta(g, TAG_LOCKED32);
@@ -3402,39 +3406,32 @@ struct MCTSTable {
                     return &n;
                 }
 
-                // Someone raced us; re-read same slot
                 cpuRelax();
-                continue;
-            }
-
-            // Same generation
-            if (mt == wantTag) {
-                if (AI_LIKELY(s.node.key == key)) return &s.node;
-                // Rare tag collision -> keep probing
+                continue; // retry same slot
             }
 
             if (mt == TAG_LOCKED32) {
-                using Clock = std::chrono::steady_clock;
-                Clock::time_point lockStart = Clock::time_point{};
-                uint64_t lockStartIdx = ~0ull;
-
-                // фиксируем "начало ожидания" для конкретного слота idx
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
                     lockStart = Clock::now();
                     lockSpins = 0;
                 }
 
-                // ждём, но ограниченно по времени
-                if (Clock::now() - lockStart > std::chrono::microseconds(AI_LOCK_WAIT_US)) {
-                    // НИКАКОГО abort: просто сдаёмся на эту попытку (симуляция может повториться)
+                if (Clock::now() - lockStart > waitBudget) {
                     return nullptr;
                 }
 
                 backoffWait(lockSpins);
-                continue; // IMPORTANT: не двигаем idx и не увеличиваем probe
+                continue; // IMPORTANT: same slot, no probe++
             }
+
+            lockStartIdx = ~0ull;
             lockSpins = 0;
+
+            if (mt == wantTag) {
+                if (AI_LIKELY(s.node.key == key)) return &s.node;
+                // rare tag collision -> keep probing
+            }
 
             if (mt == TAG_EMPTY32) {
                 uint64_t expected = packMeta(g, TAG_EMPTY32);
@@ -3458,12 +3455,10 @@ struct MCTSTable {
                     return &n;
                 }
 
-                // Someone raced us; re-read same slot
                 cpuRelax();
-                continue;
+                continue; // retry same slot
             }
 
-            // Occupied by other key => go next slot (THIS is what counts as "probe")
             idx = (idx + 1) & mask;
             ++probe;
         }
@@ -3478,8 +3473,12 @@ struct MCTSTable {
         const uint32_t wantTag = makeTag32(key);
 
         uint64_t idx = key & mask;
-
         int probe = 0;
+
+        using Clock = std::chrono::steady_clock;
+        const auto waitBudget = std::chrono::microseconds(AI_LOCK_WAIT_US);
+        Clock::time_point lockStart{};
+        uint64_t lockStartIdx = ~0ull;
         int lockSpins = 0;
 
         while (probe < PROBE_LIMIT) {
@@ -3491,33 +3490,34 @@ struct MCTSTable {
             const uint32_t mt = metaTag(m);
 
             if (mt == TAG_LOCKED32) {
-                using Clock = std::chrono::steady_clock;
-                static thread_local Clock::time_point lockStart = Clock::time_point{};
-                static thread_local uint64_t lockStartIdx = ~0ull;
-
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
                     lockStart = Clock::now();
                     lockSpins = 0;
                 }
 
-                if (Clock::now() - lockStart > std::chrono::microseconds(AI_LOCK_WAIT_US)) {
+                if (Clock::now() - lockStart > waitBudget) {
                     return nullptr;
                 }
 
                 backoffWait(lockSpins);
-                continue;
+                continue; // IMPORTANT: same slot, no probe++
             }
+
+            lockStartIdx = ~0ull;
             lockSpins = 0;
 
             if (mt == wantTag) {
                 if (AI_LIKELY(s.node.key == key)) return &s.node;
+                // rare tag collision -> probe дальше
             }
+
             if (mt == TAG_EMPTY32) return nullptr;
 
             idx = (idx + 1) & mask;
             ++probe;
         }
+
         return nullptr;
     }
 };
@@ -3699,7 +3699,52 @@ struct Trace {
     int n = 0;
     TraceStep st[MCTS_MAX_DEPTH];
 
+    AI_FORCEINLINE Trace() = default;
+
+    // copy only used prefix [0..n)
+    AI_FORCEINLINE Trace(const Trace& o) : n(o.n) {
+        if (n > 0) {
+            std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
+        }
+    }
+
+    AI_FORCEINLINE Trace& operator=(const Trace& o) {
+        if (this != &o) {
+            n = o.n;
+            if (n > 0) {
+                std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
+            }
+        }
+        return *this;
+    }
+
+    // move = same cheap prefix copy, no heap
+    AI_FORCEINLINE Trace(Trace&& o) noexcept : n(o.n) {
+        if (n > 0) {
+            std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
+        }
+        o.n = 0;
+    }
+
+    AI_FORCEINLINE Trace& operator=(Trace&& o) noexcept {
+        if (this != &o) {
+            n = o.n;
+            if (n > 0) {
+                std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
+            }
+            o.n = 0;
+        }
+        return *this;
+    }
+
     AI_FORCEINLINE void reset() { n = 0; }
+
+    AI_FORCEINLINE void copyFrom(const Trace& o) {
+        n = o.n;
+        if (n > 0) {
+            std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
+        }
+    }
 
     AI_FORCEINLINE TraceStep& push(TTNode* node, TTEdge* edge, bool flip, bool vloss) {
         if (n >= MCTS_MAX_DEPTH) {
