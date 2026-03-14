@@ -6683,6 +6683,11 @@ int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
 
     int done = 0;
 
+    int skippedConsecutive = 0;
+    int skippedTotal = 0;
+    static constexpr int MAX_SKIPPED_CONSECUTIVE = 32;
+    static constexpr int MAX_SKIPPED_TOTAL = 256;
+
     for (int it = 0; it < maxStepsHard; ++it) {
         if (std::chrono::steady_clock::now() >= tEnd) break;
         if (!rb.sampleBatch(batch, B, rng)) break;
@@ -6708,7 +6713,6 @@ int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
 
             np[(size_t)i] = (int64_t)s.nPi;
 
-            // fixed 255 slots; padded part is allowed, but must have prob=0
             for (int j = 0; j < AI_MAX_MOVES; ++j) {
                 ip[(size_t)i * (size_t)AI_MAX_MOVES + (size_t)j] = (int64_t)s.piIdx[(size_t)j];
                 pp[(size_t)i * (size_t)AI_MAX_MOVES + (size_t)j] = s.piProb[(size_t)j];
@@ -6719,10 +6723,10 @@ int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
 
         // ---- H2D (no realloc) ----
         if (useCuda) {
-            xDev.copy_(xCPU,   /*non_blocking=*/true);
+            xDev.copy_(xCPU,    /*non_blocking=*/true);
             idxDev.copy_(idxCPU, /*non_blocking=*/true);
             probDev.copy_(probCPU, /*non_blocking=*/true);
-            zDev.copy_(zCPU,   /*non_blocking=*/true);
+            zDev.copy_(zCPU,    /*non_blocking=*/true);
             nPiDev.copy_(nPiCPU, /*non_blocking=*/true);
         }
 
@@ -6743,7 +6747,6 @@ int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
                 auto valLogits = out.second;  // [B,1]
 
                 // ---- POLICY LOSS over LEGAL MOVES ONLY ----
-                // Gather only the 255 packed slots, then mask [0..nPi-1].
                 auto polFlat = pol.flatten(1).to(torch::kFloat32);   // [B,4672]
                 auto gathered = polFlat.gather(1, idxDev);           // [B,255]
 
@@ -6829,7 +6832,33 @@ int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
             }
         }
 
-        if (!didStep) break;
+        if (!didStep) {
+            ++skippedConsecutive;
+            ++skippedTotal;
+
+            if (skippedConsecutive == 1 ||
+                skippedConsecutive == 8 ||
+                skippedConsecutive == 32) {
+                std::cerr << "[Trainer] skipped batch"
+                          << " consec=" << skippedConsecutive
+                          << " total=" << skippedTotal
+                          << " ampScale=" << lastAmpScale
+                          << "\n";
+            }
+
+            if (skippedConsecutive >= MAX_SKIPPED_CONSECUTIVE ||
+                skippedTotal >= MAX_SKIPPED_TOTAL) {
+                std::cerr << "[Trainer] too many skipped batches, stopping train block"
+                          << " consec=" << skippedConsecutive
+                          << " total=" << skippedTotal
+                          << "\n";
+                break;
+            }
+
+            continue;
+        }
+
+        skippedConsecutive = 0;
 
         ++done;
         ++steps;
