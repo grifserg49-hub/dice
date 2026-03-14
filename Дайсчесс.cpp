@@ -3758,6 +3758,23 @@ static AI_FORCEINLINE void rollbackVirtualLoss(Trace& tr) {
     }
 }
 
+static AI_FORCEINLINE void cancelPendingNN(PendingNN& p) {
+    // undo virtual loss first
+    rollbackVirtualLoss(p.trace);
+
+    // release leaf if we claimed expansion but never sent it to NN thread
+    if (p.leaf) {
+        uint8_t ex = p.leaf->expanded.load(std::memory_order_acquire);
+        if (ex == 2) {
+            p.leaf->expanded.store(0, std::memory_order_release);
+        }
+    }
+
+    p.leaf = nullptr;
+    p.ml.n = 0;
+    p.trace.reset();
+}
+
 static AI_FORCEINLINE void backprop(TTNode* leaf, float v, Trace& tr) {
     rollbackVirtualLoss(tr);
 
@@ -4192,7 +4209,7 @@ struct InferenceServer {
 
     // Blocking bounded submit.
     // IMPORTANT: by lifecycle, producers must stop before stopAndDrain().
-    void submit(PendingNN&& job) {
+    bool submit(PendingNN&& job) {
         std::unique_lock<std::mutex> lk(m);
 
         cvNotFull.wait(lk, [&] {
@@ -4200,13 +4217,14 @@ struct InferenceServer {
         });
 
         // In normal lifecycle this should not happen while producers are alive.
-        if (stop.load(std::memory_order_relaxed)) return;
+        if (stop.load(std::memory_order_relaxed)) return false;
 
         q.emplace_back(std::move(job));
         qSize.store((int)q.size(), std::memory_order_relaxed);
 
         lk.unlock();
         cvNotEmpty.notify_one();
+        return true;
     }
 
 private:
@@ -4663,7 +4681,13 @@ void mctsBatchedMT(Position& rootPos,
 
                 if (needNN) {
                     nnExp.fetch_add(1, std::memory_order_relaxed);
-                    nnServer.submit(std::move(p));
+
+                    if (!nnServer.submit(std::move(p))) {
+                        cancelPendingNN(p);
+                        simFail.fetch_add(1, std::memory_order_relaxed);
+                        if (T.abort.load(std::memory_order_relaxed)) break;
+                        continue;
+                    }
                 }
             }
 
@@ -5365,7 +5389,7 @@ struct InferenceServerTrain {
 
     // Blocking bounded submit.
     // IMPORTANT: by lifecycle, producers must stop before requestStop().
-    void submit(PendingNN&& job) {
+    bool submit(PendingNN&& job) {
         std::unique_lock<std::mutex> lk(m);
 
         cvNotFull.wait(lk, [&] {
@@ -5373,13 +5397,14 @@ struct InferenceServerTrain {
         });
 
         // In normal lifecycle this should not happen while workers are alive.
-        if (stop.load(std::memory_order_relaxed)) return;
+        if (stop.load(std::memory_order_relaxed)) return false;
 
         q.emplace_back(std::move(job));
         qSize.store((int)q.size(), std::memory_order_relaxed);
 
         lk.unlock();
         cvNotEmpty.notify_one();
+        return true;
     }
 
     void waitIdle() {
@@ -5723,9 +5748,22 @@ void workerMain(unsigned tid) {
             }
 
             if (needNN && server) {
-                // bounded blocking submit:
-                // backpressure is handled here instead of busy-wait on queue size
-                server->submit(std::move(p));
+                if (cancelJob.load(std::memory_order_relaxed) ||
+                    TT->abort.load(std::memory_order_relaxed)) {
+                    cancelPendingNN(p);
+                    break;
+                }
+
+                if (!server->submit(std::move(p))) {
+                    cancelPendingNN(p);
+
+                    // Если это не глобальная отмена/abort, можно вернуть budget обратно.
+                    if (!cancelJob.load(std::memory_order_relaxed) &&
+                        !TT->abort.load(std::memory_order_relaxed)) {
+                        refundSimBudget(simsLeft);
+                    }
+                    break;
+                }
             }
         }
 
