@@ -3368,12 +3368,8 @@ struct MCTSTable {
         const uint32_t wantTag = makeTag32(key);
 
         uint64_t idx = key & mask;
-        int probe = 0;
 
-        using Clock = std::chrono::steady_clock;
-        const auto waitBudget = std::chrono::microseconds(AI_LOCK_WAIT_US);
-        Clock::time_point lockStart{};
-        uint64_t lockStartIdx = ~0ull;
+        int probe = 0;
         int lockSpins = 0;
 
         while (probe < PROBE_LIMIT) {
@@ -3383,7 +3379,7 @@ struct MCTSTable {
             const uint32_t mg = metaGen(m);
             const uint32_t mt = metaTag(m);
 
-            // older generation => treat as empty, try to claim
+            // Slot from older generation => treat as empty; try to claim it
             if (AI_UNLIKELY(mg != g)) {
                 uint64_t expected = m;
                 const uint64_t lockedMeta = packMeta(g, TAG_LOCKED32);
@@ -3406,32 +3402,39 @@ struct MCTSTable {
                     return &n;
                 }
 
+                // Someone raced us; re-read same slot
                 cpuRelax();
-                continue; // retry same slot
+                continue;
+            }
+
+            // Same generation
+            if (mt == wantTag) {
+                if (AI_LIKELY(s.node.key == key)) return &s.node;
+                // Rare tag collision -> keep probing
             }
 
             if (mt == TAG_LOCKED32) {
+                using Clock = std::chrono::steady_clock;
+                Clock::time_point lockStart = Clock::time_point{};
+                uint64_t lockStartIdx = ~0ull;
+
+                // фиксируем "начало ожидания" для конкретного слота idx
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
                     lockStart = Clock::now();
                     lockSpins = 0;
                 }
 
-                if (Clock::now() - lockStart > waitBudget) {
+                // ждём, но ограниченно по времени
+                if (Clock::now() - lockStart > std::chrono::microseconds(AI_LOCK_WAIT_US)) {
+                    // НИКАКОГО abort: просто сдаёмся на эту попытку (симуляция может повториться)
                     return nullptr;
                 }
 
                 backoffWait(lockSpins);
-                continue; // IMPORTANT: same slot, no probe++
+                continue; // IMPORTANT: не двигаем idx и не увеличиваем probe
             }
-
-            lockStartIdx = ~0ull;
             lockSpins = 0;
-
-            if (mt == wantTag) {
-                if (AI_LIKELY(s.node.key == key)) return &s.node;
-                // rare tag collision -> keep probing
-            }
 
             if (mt == TAG_EMPTY32) {
                 uint64_t expected = packMeta(g, TAG_EMPTY32);
@@ -3455,10 +3458,12 @@ struct MCTSTable {
                     return &n;
                 }
 
+                // Someone raced us; re-read same slot
                 cpuRelax();
-                continue; // retry same slot
+                continue;
             }
 
+            // Occupied by other key => go next slot (THIS is what counts as "probe")
             idx = (idx + 1) & mask;
             ++probe;
         }
@@ -3473,12 +3478,8 @@ struct MCTSTable {
         const uint32_t wantTag = makeTag32(key);
 
         uint64_t idx = key & mask;
-        int probe = 0;
 
-        using Clock = std::chrono::steady_clock;
-        const auto waitBudget = std::chrono::microseconds(AI_LOCK_WAIT_US);
-        Clock::time_point lockStart{};
-        uint64_t lockStartIdx = ~0ull;
+        int probe = 0;
         int lockSpins = 0;
 
         while (probe < PROBE_LIMIT) {
@@ -3490,34 +3491,33 @@ struct MCTSTable {
             const uint32_t mt = metaTag(m);
 
             if (mt == TAG_LOCKED32) {
+                using Clock = std::chrono::steady_clock;
+                static thread_local Clock::time_point lockStart = Clock::time_point{};
+                static thread_local uint64_t lockStartIdx = ~0ull;
+
                 if (lockStartIdx != idx) {
                     lockStartIdx = idx;
                     lockStart = Clock::now();
                     lockSpins = 0;
                 }
 
-                if (Clock::now() - lockStart > waitBudget) {
+                if (Clock::now() - lockStart > std::chrono::microseconds(AI_LOCK_WAIT_US)) {
                     return nullptr;
                 }
 
                 backoffWait(lockSpins);
-                continue; // IMPORTANT: same slot, no probe++
+                continue;
             }
-
-            lockStartIdx = ~0ull;
             lockSpins = 0;
 
             if (mt == wantTag) {
                 if (AI_LIKELY(s.node.key == key)) return &s.node;
-                // rare tag collision -> probe дальше
             }
-
             if (mt == TAG_EMPTY32) return nullptr;
 
             idx = (idx + 1) & mask;
             ++probe;
         }
-
         return nullptr;
     }
 };
@@ -3691,6 +3691,7 @@ struct TraceStep {
     TTNode* node = nullptr;
     TTEdge* edge = nullptr;
     bool flip = false;
+
     bool vloss = false;
 };
 
@@ -3698,50 +3699,7 @@ struct Trace {
     int n = 0;
     TraceStep st[MCTS_MAX_DEPTH];
 
-    AI_FORCEINLINE Trace() = default;
-
-    AI_FORCEINLINE Trace(const Trace& o) : n(o.n) {
-        if (n > 0) {
-            std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
-        }
-    }
-
-    AI_FORCEINLINE Trace& operator=(const Trace& o) {
-        if (this != &o) {
-            n = o.n;
-            if (n > 0) {
-                std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
-            }
-        }
-        return *this;
-    }
-
-    AI_FORCEINLINE Trace(Trace&& o) noexcept : n(o.n) {
-        if (n > 0) {
-            std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
-        }
-        o.n = 0;
-    }
-
-    AI_FORCEINLINE Trace& operator=(Trace&& o) noexcept {
-        if (this != &o) {
-            n = o.n;
-            if (n > 0) {
-                std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
-            }
-            o.n = 0;
-        }
-        return *this;
-    }
-
     AI_FORCEINLINE void reset() { n = 0; }
-
-    AI_FORCEINLINE void copyFrom(const Trace& o) {
-        n = o.n;
-        if (n > 0) {
-            std::memcpy(st, o.st, (size_t)n * sizeof(TraceStep));
-        }
-    }
 
     AI_FORCEINLINE TraceStep& push(TTNode* node, TTEdge* edge, bool flip, bool vloss) {
         if (n >= MCTS_MAX_DEPTH) {
@@ -4178,7 +4136,6 @@ struct InferenceServer {
 
     std::atomic<bool> stop{ false };
     std::atomic<int>  qSize{ 0 };
-    std::atomic<int>  busy{ 0 };
 
     std::mutex m;
     std::condition_variable cv;
@@ -4191,6 +4148,7 @@ struct InferenceServer {
 
     explicit InferenceServer(MCTSTable& tab) : T(tab) {
         q.clear();
+        // reserve() not available for deque
         neutralPol.assign((size_t)POLICY_SIZE, 0.0f);
         neutralLogits.assign((size_t)AI_MAX_MOVES, 0.0f);
     }
@@ -4200,18 +4158,10 @@ struct InferenceServer {
         th = std::thread([this] { this->run(); });
     }
 
-    void requestStop() {
+    void stopAndDrain() {
         stop.store(true, std::memory_order_relaxed);
         cv.notify_all();
-    }
-
-    void join() {
         if (th.joinable()) th.join();
-    }
-
-    void stopAndDrain() {
-        requestStop();
-        join();
     }
 
     int size() const { return qSize.load(std::memory_order_relaxed); }
@@ -4219,36 +4169,28 @@ struct InferenceServer {
     void submit(PendingNN&& job) {
         {
             std::lock_guard<std::mutex> lk(m);
+
+            // Pure FIFO:
             q.emplace_back(std::move(job));
+
+            // Optional: mild root priority (still no starvation in practice)
+            // if (job.isRoot) q.emplace_front(std::move(job));
+            // else            q.emplace_back(std::move(job));
+
             qSize.fetch_add(1, std::memory_order_relaxed);
         }
         cv.notify_one();
     }
 
-    void waitIdle() {
-        for (;;) {
-            if (qSize.load(std::memory_order_relaxed) == 0 &&
-                busy.load(std::memory_order_relaxed) == 0) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
-    }
-
-    void clearQueueUnsafeWhenIdle() {
-        std::lock_guard<std::mutex> lk(m);
-        q.clear();
-        qSize.store(0, std::memory_order_relaxed);
-    }
-
 private:
+    // pop up to wantB (caller holds lock)
     int popBatchUnlocked(std::vector<PendingNN>& batch, int wantB) {
         batch.clear();
         batch.reserve((size_t)wantB);
 
         int n = 0;
         while (n < wantB && !q.empty()) {
-            batch.emplace_back(std::move(q.front()));
+            batch.emplace_back(std::move(q.front())); // FIFO
             q.pop_front();
             ++n;
         }
@@ -4261,30 +4203,28 @@ private:
         batch.reserve((size_t)TRT_MAX_BATCH);
 
         for (;;) {
+            // 1) wait for at least 1 job (or stop)
             {
                 std::unique_lock<std::mutex> lk(m);
-                busy.store(0, std::memory_order_relaxed);
-
                 cv.wait(lk, [&] {
                     return stop.load(std::memory_order_relaxed) || !q.empty();
-                });
+                    });
 
                 if (stop.load(std::memory_order_relaxed) && q.empty()) break;
 
-                busy.store(1, std::memory_order_relaxed);
                 (void)popBatchUnlocked(batch, TRT_MAX_BATCH);
             }
 
-            const auto tFillEnd =
-                std::chrono::steady_clock::now() + std::chrono::microseconds(200);
-
+            // 2) small fill window to reach 256 if more jobs arrive
+            const auto tFillEnd = std::chrono::steady_clock::now() + std::chrono::microseconds(200);
             while ((int)batch.size() < TRT_MAX_BATCH &&
                 std::chrono::steady_clock::now() < tFillEnd) {
+
                 std::unique_lock<std::mutex> lk(m);
                 if (q.empty()) {
                     cv.wait_until(lk, tFillEnd, [&] {
                         return stop.load(std::memory_order_relaxed) || !q.empty();
-                    });
+                        });
                 }
                 if (q.empty()) break;
 
@@ -4319,10 +4259,207 @@ private:
 #endif
         }
 
-        busy.store(0, std::memory_order_relaxed);
+        // drain not needed: loop already drains until q empty after stop=true
     }
 };
 
+static void ensureRootExpanded(MCTSTable& T,
+    const Position& rootPos,
+    const std::array<uint64_t, 4>& path,
+    const std::array<int, 64>& mask,
+    MoveList& ml,
+    int term) {
+    TTNode* root = T.getNode(rootPos.key);
+    if (!root) return;
+
+    uint8_t ex = root->expanded.load(std::memory_order_acquire);
+    if (ex == 1) return;
+    if (ex == 2) { waitWhileExpanding(root); return; }
+
+    uint8_t expected = 0;
+    if (!root->expanded.compare_exchange_strong(expected, 2,
+        std::memory_order_acq_rel,
+        std::memory_order_relaxed)) {
+        return;
+    }
+
+    if (term) {
+        root->key = rootPos.key;
+        root->edgeBegin = 0;
+        root->edgeCount = 0;
+        root->terminal = 1;
+        root->chance = 0;
+
+        Trace empty; empty.reset();
+        backprop(root, 1.0f, empty);
+        publishReady(root, rootPos.key, 0, 0, 1, 0);
+        return;
+    }
+
+    if (ml.n == 0) {
+        publishReady(root, rootPos.key, 0, 0, 0, 1);
+        return;
+    }
+
+    PendingNN p;
+    p.leaf = root;
+    p.pos = rootPos;
+    p.ml = ml;
+    p.trace.reset();
+
+    float v = 0.5f;
+
+#if AI_HAVE_CUDA_KERNELS
+    if (!g_trt.inferBatchGather(&p, 1)) {
+        v = 0.5f;
+        std::vector<float> z((size_t)AI_MAX_MOVES, 0.0f);
+        expandLeafWithGatheredLogits(T, p, v, z.data());
+        return;
+    }
+    v = g_trt.valueHost(0);
+    const float* logits = g_trt.gatherLogitsHostPtr(0);
+    expandLeafWithGatheredLogits(T, p, v, logits);
+#else
+    std::vector<float> pol((size_t)POLICY_SIZE, 0.0f);
+    if (!g_trt.inferBatch(&p.pos, 1, &v, pol.data())) {
+        v = 0.5f;
+        std::fill(pol.begin(), pol.end(), 0.0f);
+    }
+    expandLeafWithOutputs(T, p, v, pol.data());
+#endif
+}
+
+static bool runOneSim(MCTSTable& T,
+    const Position& rootPos,
+    const std::array<uint64_t, 4>& path,
+    const std::array<int, 64>& mask,
+    PendingNN& outPending,
+    bool& outNeedNN,
+    uint32_t rngJitter) {
+
+    outNeedNN = false;
+
+    if (AI_UNLIKELY(T.abort.load(std::memory_order_relaxed))) return false;
+
+    Position pos = rootPos;
+    Trace tr; tr.reset();
+    bool isRoot = true;
+
+    for (;;) {
+        if (AI_UNLIKELY(T.abort.load(std::memory_order_relaxed))) {
+            rollbackVirtualLoss(tr);
+            return false;
+        }
+
+        // Depth guard
+        if (tr.n >= MCTS_MAX_DEPTH - 2) {
+            rollbackVirtualLoss(tr);
+            return false;
+        }
+
+        TTNode* node = T.getNode(pos.key);
+        if (!node) {
+            rollbackVirtualLoss(tr);
+            return false;
+        }
+
+        uint8_t ex = node->expanded.load(std::memory_order_acquire);
+
+        // Someone else expanding
+        if (ex == 2) {
+            if (!waitWhileExpanding(node)) {
+                rollbackVirtualLoss(tr);
+                return false;
+            }
+            continue;
+        }
+
+        // Need expansion
+        if (ex == 0) {
+            uint8_t expected = 0;
+            if (!node->expanded.compare_exchange_strong(expected, 2,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+                continue;
+            }
+
+            MoveList ml;
+            int term = 0;
+            Position tmp = pos;
+
+            genLegal(tmp,
+                path,
+                mask,
+                ml, term);
+
+            if (term) {
+                node->key = pos.key;
+                node->edgeBegin = 0;
+                node->edgeCount = 0;
+                node->terminal = 1;
+                node->chance = 0;
+
+                backprop(node, 1.0f, tr);
+                publishReady(node, pos.key, 0, 0, 1, 0);
+                return true;
+            }
+
+            if (ml.n == 0) {
+                // Chance node
+                publishReady(node, pos.key, 0, 0, 0, 1);
+
+                tr.push(node, nullptr, /*flip=*/true, /*vloss=*/false);
+                makeRandom(pos,node);
+                isRoot = false;
+                continue;
+            }
+
+            // Need NN
+            outNeedNN = true;
+            outPending.leaf = node;
+            outPending.pos = pos;
+            outPending.ml = ml;
+            outPending.trace = tr;
+            return true;
+        }
+
+        // Expanded
+        if (node->terminal) {
+            backprop(node, 1.0f, tr);
+            return true;
+        }
+
+        if (node->edgeCount == 0) {
+            if (node->chance) {
+                tr.push(node, nullptr, /*flip=*/true, /*vloss=*/false);
+                makeRandom(pos,node);
+                isRoot = false;
+                continue;
+            }
+            else {
+                float vLeaf = nodeQ(*node);
+                backprop(node, vLeaf, tr);
+                return true;
+            }
+        }
+
+        // Decision node: PUCT
+        const uint32_t pv = node->visits.load(std::memory_order_relaxed);
+        const float parentQ = nodeQ(*node);
+        const float cpuct = cpuctFromVisits(pv, isRoot);
+
+        TTEdge* e0 = T.edgePtr(node->edgeBegin);
+        int bestI = selectPUCT(*node, e0, cpuct, pv, parentQ, rngJitter);
+        TTEdge* e = &e0[bestI];
+
+        // Classic virtual loss (mark the selected edge as "in flight")
+        TraceStep& step = tr.push(node, e, /*flip=*/false, /*vloss=*/true);
+        applyVirtualLoss(step);
+
+        makeMove(pos, mask, e->move);
+        isRoot = false;
+    }
+}
 static AI_FORCEINLINE char promoChar(int promo) {
     switch (promo) {
     case 1: return 'n';
@@ -4374,239 +4511,6 @@ static void extractBestPVUntilChance(MCTSTable& T,
         makeMove(pos, mask, m);
     }
 }
-struct InteractiveSearchPool {
-    std::vector<std::thread> pool;
-    std::mutex m;
-    std::condition_variable cv;
-
-    bool stop = false;
-    int jobId = 0;
-
-    std::atomic<int> workersBusy{ 0 };
-    std::atomic<bool> cancelJob{ false };
-
-    MCTSTable* T = nullptr;
-    InferenceServer* srv = nullptr;
-    const Position* rootPos = nullptr;
-    const std::array<uint64_t, 4>* path = nullptr;
-    const std::array<int, 64>* mask = nullptr;
-    std::chrono::steady_clock::time_point deadline{};
-
-    unsigned threads = 1;
-
-    void start(unsigned nThreads) {
-        stop = false;
-        threads = std::max(1u, nThreads);
-        pool.reserve(threads);
-
-        for (unsigned tid = 0; tid < threads; ++tid) {
-            pool.emplace_back([this, tid] { this->workerMain(tid); });
-        }
-    }
-
-    void shutdown() {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            stop = true;
-        }
-        cv.notify_all();
-        for (auto& th : pool) {
-            if (th.joinable()) th.join();
-        }
-        pool.clear();
-    }
-
-    void runTimed(MCTSTable& TT,
-        InferenceServer& server,
-        const Position& rp,
-        const std::array<uint64_t, 4>& pth,
-        const std::array<int, 64>& msk,
-        double timeSec) {
-        if (pool.empty()) return;
-        if (TT.abort.load(std::memory_order_relaxed)) return;
-
-        cancelJob.store(false, std::memory_order_relaxed);
-        workersBusy.store((int)threads, std::memory_order_relaxed);
-
-        {
-            std::lock_guard<std::mutex> lk(m);
-            T = &TT;
-            srv = &server;
-            rootPos = &rp;
-            path = &pth;
-            mask = &msk;
-            deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeSec);
-            ++jobId;
-        }
-        cv.notify_all();
-
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (TT.abort.load(std::memory_order_relaxed)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        cancelJob.store(true, std::memory_order_relaxed);
-
-        while (workersBusy.load(std::memory_order_relaxed) != 0) {
-            if (TT.abort.load(std::memory_order_relaxed)) {
-                cancelJob.store(true, std::memory_order_relaxed);
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
-
-        server.waitIdle();
-    }
-
-private:
-    void workerMain(unsigned tid) {
-        int myJob = 0;
-        uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
-
-        for (;;) {
-            MCTSTable* TT = nullptr;
-            InferenceServer* server = nullptr;
-            const Position* rp = nullptr;
-            const std::array<uint64_t, 4>* pth = nullptr;
-            const std::array<int, 64>* msk = nullptr;
-            std::chrono::steady_clock::time_point dl{};
-
-            {
-                std::unique_lock<std::mutex> lk(m);
-                cv.wait(lk, [&] { return stop || jobId != myJob; });
-                if (stop) return;
-
-                myJob = jobId;
-                TT = T;
-                server = srv;
-                rp = rootPos;
-                pth = path;
-                msk = mask;
-                dl = deadline;
-            }
-
-            if (!TT || !server || !rp || !pth || !msk) {
-                workersBusy.fetch_sub(1, std::memory_order_relaxed);
-                continue;
-            }
-
-            uint64_t iter = 0;
-            for (;;) {
-                if (TT->abort.load(std::memory_order_relaxed)) break;
-                if (cancelJob.load(std::memory_order_relaxed)) break;
-
-                if ((iter++ & 63ull) == 0ull) {
-                    if (std::chrono::steady_clock::now() >= dl) break;
-                }
-
-                bool didUsefulWork = false;
-                const int B = std::max(1, g_nnBatch);
-
-                for (int k = 0; k < B; ++k) {
-                    if (TT->abort.load(std::memory_order_relaxed)) break;
-                    if (cancelJob.load(std::memory_order_relaxed)) break;
-
-                    if ((k & 15) == 0) {
-                        if (std::chrono::steady_clock::now() >= dl) break;
-                    }
-
-                    static thread_local int throttleSpins = 0;
-                    int qs = server->size();
-                    throttleOnNNQueue_NoSleep(qs, throttleSpins);
-
-                    if (qs > 2000) {
-                        cpuRelax();
-                        continue;
-                    }
-
-                    PendingNN p;
-                    bool needNN = false;
-
-                    bool ok = runOneSim(*TT, *rp, *pth, *msk,
-                        p, needNN,
-                        jitterBase + (uint32_t)k * 1337u);
-
-                    if (!ok) {
-                        if (TT->abort.load(std::memory_order_relaxed)) break;
-                        if (cancelJob.load(std::memory_order_relaxed)) break;
-                        cpuRelax();
-                        continue;
-                    }
-
-                    didUsefulWork = true;
-
-                    if (needNN) {
-                        server->submit(std::move(p));
-                    }
-                }
-
-                if (!didUsefulWork) {
-                    cpuRelax();
-                }
-            }
-
-            workersBusy.fetch_sub(1, std::memory_order_relaxed);
-        }
-    }
-};
-
-struct InteractiveSearchContext {
-    MCTSTable T;
-    InferenceServer server;
-    InteractiveSearchPool pool;
-
-    explicit InteractiveSearchContext(size_t nodePow2, size_t edgeCap)
-        : T(nodePow2, edgeCap), server(T) {
-    }
-
-    void start() {
-        server.start();
-        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        const unsigned n = std::max(1u, hw / 2);
-        pool.start(n);
-    }
-
-    void stop() {
-        pool.shutdown();
-        server.requestStop();
-        server.join();
-    }
-
-    void resetForNewSearch() {
-        server.waitIdle();
-        server.clearQueueUnsafeWhenIdle();
-        T.newGame();
-    }
-};
-
-static std::mutex g_interactiveInitMutex;
-static std::mutex g_interactiveRunMutex;
-static std::unique_ptr<InteractiveSearchContext> g_interactive;
-
-static bool ensureInteractiveSearchReady() {
-    std::lock_guard<std::mutex> lk(g_interactiveInitMutex);
-    if (g_interactive) return true;
-
-    try {
-        g_interactive = std::make_unique<InteractiveSearchContext>(
-            1ull << 25,
-            1ull << 27
-        );
-        g_interactive->start();
-        return true;
-    }
-    catch (...) {
-        g_interactive.reset();
-        return false;
-    }
-}
-
-static void shutdownInteractiveSearch() {
-    std::lock_guard<std::mutex> lk(g_interactiveInitMutex);
-    if (!g_interactive) return;
-    g_interactive->stop();
-    g_interactive.reset();
-}
-
 void mctsBatchedMT(Position& rootPos,
     std::array<uint64_t, 4>& path,
     std::array<int, 64>& mask,
@@ -4629,19 +4533,12 @@ void mctsBatchedMT(Position& rootPos,
         return;
     }
 
-    if (!ensureInteractiveSearchReady()) {
-        outEvalWhite = 0.5f;
-        outRootMoves.clear();
-        outPVBeforeRoll.clear();
-        return;
-    }
+    const size_t nodePow2 = 1ull << 25;
+    const size_t edgeCap = 1ull << 27;
 
-    std::lock_guard<std::mutex> runLock(g_interactiveRunMutex);
-    InteractiveSearchContext& ctx = *g_interactive;
+    MCTSTable T(nodePow2, edgeCap);
 
-    ctx.resetForNewSearch();
-
-    TTNode* rootNode = ctx.T.getNode(rootPos.key);
+    TTNode* rootNode = T.getNode(rootPos.key);
     if (!rootNode) {
         outEvalWhite = 0.5f;
         outRootMoves.clear();
@@ -4649,9 +4546,9 @@ void mctsBatchedMT(Position& rootPos,
         return;
     }
 
-    ensureRootExpanded(ctx.T, rootPos, path, mask, ml, term);
+    ensureRootExpanded(T, rootPos, path, mask, ml, term);
 
-    if (ctx.T.abort.load(std::memory_order_acquire)) {
+    if (T.abort.load(std::memory_order_acquire)) {
         outEvalWhite = 0.5f;
         outRootMoves.clear();
         outPVBeforeRoll.clear();
@@ -4659,9 +4556,89 @@ void mctsBatchedMT(Position& rootPos,
     }
 
     RootNoiseBackup rootNoiseBk;
-    applyTemporaryRootNoise(ctx.T, rootPos, rootNoise, rootNoiseBk);
+    applyTemporaryRootNoise(T, rootPos, rootNoise, rootNoiseBk);
 
-    ctx.pool.runTimed(ctx.T, ctx.server, rootPos, path, mask, timeSec);
+    InferenceServer nnServer(T);
+    nnServer.start();
+
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned threads = std::max(1u, hw / 2);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto tEnd = t0 + std::chrono::duration<double>(timeSec);
+
+    std::atomic<bool> stop{ false };
+    std::atomic<uint64_t> simOK{ 0 }, simFail{ 0 }, nnExp{ 0 };
+
+    auto worker = [&](unsigned tid) {
+        uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
+
+        uint64_t iter = 0;
+        for (;;) {
+            if (stop.load(std::memory_order_relaxed)) break;
+            if (T.abort.load(std::memory_order_relaxed)) break;
+
+            if (nnServer.size() > 4096) {
+                static thread_local int throttleSpins2 = 0;
+                throttleOnNNQueue_NoSleep(999999, throttleSpins2);
+                continue;
+            }
+
+            if ((iter++ & 63ull) == 0ull) {
+                if (std::chrono::steady_clock::now() >= tEnd) break;
+            }
+
+            bool didUsefulWork = false;
+
+            const int B = std::max(1, g_nnBatch);
+            for (int k = 0; k < B; ++k) {
+                if (T.abort.load(std::memory_order_relaxed)) break;
+
+                PendingNN p;
+                bool needNN = false;
+                static thread_local int throttleSpins = 0;
+                int qs = nnServer.size();
+                throttleOnNNQueue_NoSleep(qs, throttleSpins);
+
+                if (qs > 2000) continue;
+
+                bool ok = runOneSim(T, rootPos, path, mask,
+                    p, needNN,
+                    jitterBase + (uint32_t)k * 1337u);
+
+                if (!ok) {
+                    simFail.fetch_add(1, std::memory_order_relaxed);
+                    if (T.abort.load(std::memory_order_relaxed)) break;
+                    continue;
+                }
+
+                didUsefulWork = true;
+                simOK.fetch_add(1, std::memory_order_relaxed);
+
+                if (needNN) {
+                    nnExp.fetch_add(1, std::memory_order_relaxed);
+                    nnServer.submit(std::move(p));
+                }
+            }
+
+            if (!didUsefulWork) {
+                cpuRelax();
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker, t);
+
+    while (std::chrono::steady_clock::now() < tEnd) {
+        if (T.abort.load(std::memory_order_relaxed)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    stop.store(true, std::memory_order_relaxed);
+
+    for (auto& th : pool) th.join();
+    nnServer.stopAndDrain();
 
     restoreTemporaryRootNoise(rootNoiseBk);
 
@@ -4671,7 +4648,7 @@ void mctsBatchedMT(Position& rootPos,
     outRootMoves.clear();
     uint8_t ex = rootNode->expanded.load(std::memory_order_acquire);
     if (ex == 1 && rootNode->edgeCount) {
-        TTEdge* e0 = ctx.T.edgePtr(rootNode->edgeBegin);
+        TTEdge* e0 = T.edgePtr(rootNode->edgeBegin);
         outRootMoves.reserve(rootNode->edgeCount);
 
         for (int i = 0; i < (int)rootNode->edgeCount; ++i) {
@@ -4697,7 +4674,10 @@ void mctsBatchedMT(Position& rootPos,
         }
     }
 
-    extractBestPVUntilChance(ctx.T, rootPos, mask, outPVBeforeRoll, 256);
+    // NEW: вытаскиваем первую линию до броска кубиков
+    extractBestPVUntilChance(T, rootPos, mask, outPVBeforeRoll, 256);
+
+    (void)simOK; (void)simFail; (void)nnExp;
 }
 
 // ===================== TRAINING PATCH BEGIN (FINAL) =====================
@@ -7169,8 +7149,7 @@ std::cout << "\n";
 
     cin.get();
 
-    shutdownInteractiveSearch();
-
+    // optional clean shutdown
     {
         std::lock_guard<std::mutex> lk(g_trtMutex);
         g_trt.shutdown();
