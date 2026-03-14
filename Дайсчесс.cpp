@@ -6313,66 +6313,111 @@ double computeRestartWarmupMultiplier(uint64_t s) const {
                   << ", step=" << steps << ")\n";
     }
 }
+static AI_FORCEINLINE bool endsWithStr(const std::string& s, const char* suf) {
+    const size_t n = std::strlen(suf);
+    return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+}
+void init(Net& model, Net& emaModel) {
+    try { torch::set_num_threads(1); }
+    catch (...) {}
+    try { torch::set_num_interop_threads(1); }
+    catch (...) {}
 
-    void init(Net& model, Net& emaModel) {
-        // Stop libtorch from stealing CPU threads
-        try { torch::set_num_threads(1); }
-        catch (...) {}
-        try { torch::set_num_interop_threads(1); }
-        catch (...) {}
+    device = torch::Device(torch::kCPU);
+    useCuda = false;
 
-        device = torch::Device(torch::kCPU);
-        useCuda = false;
-
-        try {
-            if (torch::cuda::is_available() && torch::cuda::device_count() > 0) {
-                device = torch::Device(torch::kCUDA, 0);
-                useCuda = true;
-            }
-        }
-        catch (...) {
-            device = torch::Device(torch::kCPU);
-            useCuda = false;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(g_modelMutex);
-            model->to(device);
-            model->train();
-
-            emaModel->to(device);
-            emaModel->eval();
-        }
-
-        opt = std::make_unique<torch::optim::AdamW>(
-            model->parameters(),
-            torch::optim::AdamWOptions(initial_lr).weight_decay(wd)
-        );
-resumeStartStep = steps;   // important for restart-warmup
-current_lr = -1.0;        // force apply
-updateLR(true);
-        auto makeCPU = [&](torch::IntArrayRef sizes, torch::ScalarType t) {
-            auto ten = torch::empty(sizes, torch::TensorOptions().dtype(t).device(torch::kCPU));
-            if (useCuda) ten = ten.pin_memory();
-            return ten;
-            };
-
-        xCPU = makeCPU({ B, NN_SQ_PLANES, 8, 8 }, torch::kFloat32);
-        idxCPU = makeCPU({ B, AI_MAX_MOVES }, torch::kInt64);
-        probCPU = makeCPU({ B, AI_MAX_MOVES }, torch::kFloat32);
-        zCPU = makeCPU({ B, 1 }, torch::kFloat32);
-
-        if (useCuda) {
-            xDev = torch::empty({ B, NN_SQ_PLANES, 8, 8 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-            idxDev = torch::empty({ B, AI_MAX_MOVES }, torch::TensorOptions().dtype(torch::kInt64).device(device));
-            probDev = torch::empty({ B, AI_MAX_MOVES }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-            zDev = torch::empty({ B, 1 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        }
-        else {
-            // CPU mode: alias
-            xDev = xCPU; idxDev = idxCPU; probDev = probCPU; zDev = zCPU;
+    try {
+        if (torch::cuda::is_available() && torch::cuda::device_count() > 0) {
+            device = torch::Device(torch::kCUDA, 0);
+            useCuda = true;
         }
     }
+    catch (...) {
+        device = torch::Device(torch::kCPU);
+        useCuda = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_modelMutex);
+        model->to(device);
+        model->train();
+
+        emaModel->to(device);
+        emaModel->eval();
+    }
+
+    // NEW: AdamW with no weight decay on BN / bias
+    std::vector<torch::Tensor> decayParams;
+    std::vector<torch::Tensor> noDecayParams;
+
+    {
+        auto named = model->named_parameters(/*recurse=*/true);
+        for (const auto& kv : named) {
+            const std::string name = kv.key();
+            const torch::Tensor& p = kv.value();
+
+            if (!p.defined() || !p.requires_grad()) continue;
+
+            const bool isBias = endsWithStr(name, ".bias");
+            const bool is1D = p.dim() <= 1;
+
+            if (isBias || is1D) noDecayParams.push_back(p);
+            else                decayParams.push_back(p);
+        }
+    }
+
+    const size_t decayCount = decayParams.size();
+    const size_t noDecayCount = noDecayParams.size();
+
+    if (!decayParams.empty()) {
+        opt = std::make_unique<torch::optim::AdamW>(
+            decayParams,
+            torch::optim::AdamWOptions(initial_lr).weight_decay(wd)
+        );
+    } else {
+        opt = std::make_unique<torch::optim::AdamW>(
+            noDecayParams,
+            torch::optim::AdamWOptions(initial_lr).weight_decay(0.0)
+        );
+        noDecayParams.clear();
+    }
+
+    if (!noDecayParams.empty()) {
+        torch::optim::OptimizerParamGroup g(noDecayParams);
+        auto& o = static_cast<torch::optim::AdamWOptions&>(g.options());
+        o.lr(initial_lr);
+        o.weight_decay(0.0);
+        opt->add_param_group(std::move(g));
+    }
+
+    std::cerr << "[Trainer] AdamW groups: decay=" << decayCount
+              << " no_decay=" << noDecayCount << "\n";
+
+    resumeStartStep = steps;
+    current_lr = -1.0;
+    updateLR(true);
+
+    auto makeCPU = [&](torch::IntArrayRef sizes, torch::ScalarType t) {
+        auto ten = torch::empty(sizes, torch::TensorOptions().dtype(t).device(torch::kCPU));
+        if (useCuda) ten = ten.pin_memory();
+        return ten;
+    };
+
+    xCPU = makeCPU({ B, NN_SQ_PLANES, 8, 8 }, torch::kFloat32);
+    idxCPU = makeCPU({ B, AI_MAX_MOVES }, torch::kInt64);
+    probCPU = makeCPU({ B, AI_MAX_MOVES }, torch::kFloat32);
+    zCPU = makeCPU({ B, 1 }, torch::kFloat32);
+
+    if (useCuda) {
+        xDev = torch::empty({ B, NN_SQ_PLANES, 8, 8 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        idxDev = torch::empty({ B, AI_MAX_MOVES }, torch::TensorOptions().dtype(torch::kInt64).device(device));
+        probDev = torch::empty({ B, AI_MAX_MOVES }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        zDev = torch::empty({ B, 1 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    }
+    else {
+        xDev = xCPU; idxDev = idxCPU; probDev = probCPU; zDev = zCPU;
+    }
+}
 
     // Train block with a strict time budget.
     int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
