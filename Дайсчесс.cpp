@@ -3697,7 +3697,26 @@ struct PendingNN {
     Position pos;
     MoveList ml;
     Trace trace;
+
+    // precomputed CHW policy indices for ml.m[0..ml.n)
+    std::array<uint16_t, AI_MAX_MOVES> policyIdx{};
 };
+
+static constexpr uint16_t INVALID_POLICY_IDX = 0xFFFFu;
+
+static AI_FORCEINLINE void fillPendingPolicyIdx(PendingNN& p) {
+    const int n = p.ml.n;
+
+    for (int i = 0; i < n; ++i) {
+        const int k = policyIndexCHWCanonical(p.ml.m[i], p.pos);
+        p.policyIdx[(size_t)i] =
+            ((unsigned)k < (unsigned)POLICY_SIZE) ? (uint16_t)k : INVALID_POLICY_IDX;
+    }
+
+    for (int i = n; i < AI_MAX_MOVES; ++i) {
+        p.policyIdx[(size_t)i] = INVALID_POLICY_IDX;
+    }
+}
 
 static AI_FORCEINLINE void applyVirtualLoss(TraceStep& s) {
     if (!s.vloss) return;
@@ -4086,15 +4105,13 @@ bool TrtRunner::inferBatchGather(const PendingNN* jobs, int B) {
 
 #if AI_HAVE_CUDA_KERNELS
     for (int i = 0; i < B; ++i) {
-        const MoveList& ml = jobs[i].ml;
         int* idxBase = hGatherIdxPinned + (size_t)i * (size_t)AI_MAX_MOVES;
-
         std::fill_n(idxBase, AI_MAX_MOVES, -1);
 
-        const int n = ml.n;
+        const int n = jobs[i].ml.n;
         for (int j = 0; j < n; ++j) {
-            int k = policyIndexCHWCanonical(ml.m[j], jobs[i].pos);
-            idxBase[j] = ((unsigned)k < (unsigned)POLICY_SIZE) ? k : -1;
+            const uint16_t k = jobs[i].policyIdx[(size_t)j];
+            idxBase[j] = (k == INVALID_POLICY_IDX) ? -1 : (int)k;
         }
     }
 #endif
@@ -4341,6 +4358,7 @@ static void ensureRootExpanded(MCTSTable& T,
     p.pos = rootPos;
     p.ml = ml;
     p.trace.reset();
+    fillPendingPolicyIdx(p);
 
     float v = 0.5f;
 
@@ -4455,6 +4473,7 @@ static bool runOneSim(MCTSTable& T,
             outPending.pos = pos;
             outPending.ml = ml;
             outPending.trace = tr;
+            fillPendingPolicyIdx(outPending);
             return true;
         }
 
@@ -5775,6 +5794,7 @@ static void ensureExpandedTrain(MCTSTable& T,
     p.pos = rootPos;
     p.ml = ml;
     p.trace.reset();
+    fillPendingPolicyIdx(p);
 
     float v = 0.5f;
 
