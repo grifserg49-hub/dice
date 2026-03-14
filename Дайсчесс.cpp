@@ -5608,8 +5608,16 @@ struct SearchPool {
     std::vector<std::thread> pool;
     std::mutex m;
     std::condition_variable cv;
+
     bool stop = false;
+
     std::atomic<bool> cancelJob{ false };
+
+    // FAIL-FAST state
+    std::atomic<bool> fatal{ false };
+    std::mutex fatalM;
+    std::string fatalReason;
+
     // job dispatch
     int jobId = 0;
     std::atomic<int> workersBusy{ 0 };
@@ -5626,6 +5634,13 @@ struct SearchPool {
 
     void start(unsigned nThreads) {
         stop = false;
+        cancelJob.store(false, std::memory_order_relaxed);
+        fatal.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(fatalM);
+            fatalReason.clear();
+        }
+
         threads = std::max(1u, nThreads);
         pool.reserve(threads);
 
@@ -5639,9 +5654,52 @@ struct SearchPool {
             std::lock_guard<std::mutex> lk(m);
             stop = true;
         }
+        cancelJob.store(true, std::memory_order_relaxed);
+        simsLeft.store(0, std::memory_order_relaxed);
+
         cv.notify_all();
-        for (auto& th : pool) if (th.joinable()) th.join();
+
+        for (auto& th : pool) {
+            if (th.joinable()) th.join();
+        }
         pool.clear();
+    }
+
+    bool isFatal() const {
+        return fatal.load(std::memory_order_acquire);
+    }
+
+    std::string getFatalReason() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(fatalM));
+        return fatalReason;
+    }
+
+    [[noreturn]] void failFast(const std::string& reason, MCTSTable* tt = nullptr) {
+        bool wasFatal = fatal.exchange(true, std::memory_order_acq_rel);
+        if (!wasFatal) {
+            std::lock_guard<std::mutex> lk(fatalM);
+            fatalReason = reason;
+        }
+
+        if (tt) {
+            tt->abort.store(true, std::memory_order_release);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+        }
+
+        cancelJob.store(true, std::memory_order_relaxed);
+        simsLeft.store(0, std::memory_order_relaxed);
+        cv.notify_all();
+
+        for (auto& th : pool) {
+            if (th.joinable()) th.join();
+        }
+        pool.clear();
+
+        throw std::runtime_error("[SearchPool] FATAL: " + getFatalReason());
     }
 
     void runSims(MCTSTable& TT,
@@ -5650,7 +5708,14 @@ struct SearchPool {
         const std::array<uint64_t, 4>& pth,
         const std::array<int, 64>& msk,
         int sims) {
-        if (pool.empty()) return;
+
+        if (isFatal()) {
+            throw std::runtime_error("[SearchPool] already failed: " + getFatalReason());
+        }
+
+        if (pool.empty()) {
+            failFast("runSims() called with no worker threads", &TT);
+        }
 
         if (TT.abort.load(std::memory_order_relaxed)) return;
 
@@ -5669,8 +5734,6 @@ struct SearchPool {
         }
         cv.notify_all();
 
-        // ВАЖНО: даже если TT.abort == true, мы всё равно ждём,
-        // чтобы воркеры гарантированно вышли, иначе нельзя делать T.newGame().
         const auto t0 = std::chrono::steady_clock::now();
         const auto hardTimeout = std::chrono::seconds(2);
 
@@ -5678,16 +5741,12 @@ struct SearchPool {
             if (workersBusy.load(std::memory_order_relaxed) == 0) break;
 
             if (TT.abort.load(std::memory_order_relaxed)) {
-                // ускоряем останов
                 cancelJob.store(true, std::memory_order_relaxed);
                 simsLeft.store(0, std::memory_order_relaxed);
             }
 
             if (std::chrono::steady_clock::now() - t0 > hardTimeout) {
-                // Если реально зависли — лучше остановить пул, чем продолжать с битым состоянием.
-                std::cerr << "[SearchPool] ERROR: workers did not stop in time. Forcing shutdown.\n";
-                shutdown();
-                break;
+                failFast("workers did not stop in time", &TT);
             }
 
             std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -5695,84 +5754,88 @@ struct SearchPool {
     }
 
 private:
-void workerMain(unsigned tid) {
-    int myJob = 0;
-    uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
+    void workerMain(unsigned tid) {
+        int myJob = 0;
+        uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
 
-    for (;;) {
-        MCTSTable* TT = nullptr;
-        InferenceServerTrain* server = nullptr;
-        const Position* rp = nullptr;
-        const std::array<uint64_t, 4>* pth = nullptr;
-        const std::array<int, 64>* msk = nullptr;
-
-        {
-            std::unique_lock<std::mutex> lk(m);
-            cv.wait(lk, [&] { return stop || jobId != myJob; });
-            if (stop) return;
-
-            myJob = jobId;
-            TT = T;
-            server = srv;
-            rp = rootPos;
-            pth = path;
-            msk = mask;
-        }
-
-        if (!TT || TT->abort.load(std::memory_order_relaxed)) {
-            workersBusy.fetch_sub(1, std::memory_order_relaxed);
-            continue;
-        }
-
-        int k = 0;
         for (;;) {
-            if (TT->abort.load(std::memory_order_relaxed)) break;
-            if (cancelJob.load(std::memory_order_relaxed)) break;
+            MCTSTable* TT = nullptr;
+            InferenceServerTrain* server = nullptr;
+            const Position* rp = nullptr;
+            const std::array<uint64_t, 4>* pth = nullptr;
+            const std::array<int, 64>* msk = nullptr;
 
-            // claim exactly one simulation budget item
-            if (!tryClaimSimBudget(simsLeft)) break;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] {
+                    return stop || jobId != myJob;
+                });
 
-            PendingNN p;
-            bool needNN = false;
+                if (stop) return;
 
-            bool ok = runOneSim(*TT, *rp, *pth, *msk,
-                                p, needNN,
-                                jitterBase + (uint32_t)(k++) * 1337u);
+                myJob = jobId;
+                TT = T;
+                server = srv;
+                rp = rootPos;
+                pth = path;
+                msk = mask;
+            }
 
-            if (!ok) {
-                // simulation did not actually happen -> give budget back
-                refundSimBudget(simsLeft);
-
-                if (TT->abort.load(std::memory_order_relaxed)) break;
-                if (cancelJob.load(std::memory_order_relaxed)) break;
-
-                cpuRelax();
+            if (!TT || TT->abort.load(std::memory_order_relaxed)) {
+                workersBusy.fetch_sub(1, std::memory_order_relaxed);
                 continue;
             }
 
-            if (needNN && server) {
-                if (cancelJob.load(std::memory_order_relaxed) ||
-                    TT->abort.load(std::memory_order_relaxed)) {
-                    cancelPendingNN(p);
-                    break;
+            int k = 0;
+            for (;;) {
+                if (fatal.load(std::memory_order_relaxed)) break;
+                if (TT->abort.load(std::memory_order_relaxed)) break;
+                if (cancelJob.load(std::memory_order_relaxed)) break;
+
+                if (!tryClaimSimBudget(simsLeft)) break;
+
+                PendingNN p;
+                bool needNN = false;
+
+                bool ok = runOneSim(*TT, *rp, *pth, *msk,
+                                    p, needNN,
+                                    jitterBase + (uint32_t)(k++) * 1337u);
+
+                if (!ok) {
+                    refundSimBudget(simsLeft);
+
+                    if (fatal.load(std::memory_order_relaxed)) break;
+                    if (TT->abort.load(std::memory_order_relaxed)) break;
+                    if (cancelJob.load(std::memory_order_relaxed)) break;
+
+                    cpuRelax();
+                    continue;
                 }
 
-                if (!server->submit(std::move(p))) {
-                    cancelPendingNN(p);
-
-                    // Если это не глобальная отмена/abort, можно вернуть budget обратно.
-                    if (!cancelJob.load(std::memory_order_relaxed) &&
-                        !TT->abort.load(std::memory_order_relaxed)) {
-                        refundSimBudget(simsLeft);
+                if (needNN && server) {
+                    if (fatal.load(std::memory_order_relaxed) ||
+                        cancelJob.load(std::memory_order_relaxed) ||
+                        TT->abort.load(std::memory_order_relaxed)) {
+                        cancelPendingNN(p);
+                        break;
                     }
-                    break;
+
+                    if (!server->submit(std::move(p))) {
+                        cancelPendingNN(p);
+
+                        if (!fatal.load(std::memory_order_relaxed) &&
+                            !cancelJob.load(std::memory_order_relaxed) &&
+                            !TT->abort.load(std::memory_order_relaxed)) {
+                            refundSimBudget(simsLeft);
+                        }
+                        break;
+                    }
                 }
             }
-        }
 
-        workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            workersBusy.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
-}
 };
 
 // ------------------------------------------------------------
