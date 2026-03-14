@@ -6185,7 +6185,33 @@ struct TrainerState {
     std::atomic<uint64_t> steps{ 0 };
     std::atomic<float> lastLoss{ 0.0f };
 };
+static void emaUpdate(Net& ema, Net& src, double decay) {
+    torch::NoGradGuard ng;
 
+    auto srcParams = src->named_parameters(true);
+    auto emaParams = ema->named_parameters(true);
+
+    for (const auto& kv : srcParams) {
+        auto* e = emaParams.find(kv.key());
+        if (!e) continue;
+
+        auto s = kv.value().detach().to(e->device(), e->scalar_type());
+        e->mul_(decay);
+        e->add_(s, 1.0 - decay);
+    }
+
+    auto srcBufs = src->named_buffers(true);
+    auto emaBufs = ema->named_buffers(true);
+
+    for (const auto& kv : srcBufs) {
+        auto* e = emaBufs.find(kv.key());
+        if (!e) continue;
+
+        e->copy_(kv.value().detach().to(e->device(), e->scalar_type()));
+    }
+
+    ema->eval();
+}
 struct Trainer {
     torch::Device device{ torch::kCPU };
     bool useCuda = false;
@@ -6568,33 +6594,7 @@ static bool loadOrCreateEmaModel(const std::string& emaFile, Net& emaModel, Net&
     }
 }
 
-static void emaUpdate(Net& ema, Net& src, double decay) {
-    torch::NoGradGuard ng;
 
-    auto srcParams = src->named_parameters(true);
-    auto emaParams = ema->named_parameters(true);
-
-    for (const auto& kv : srcParams) {
-        auto* e = emaParams.find(kv.key());
-        if (!e) continue;
-
-        auto s = kv.value().detach().to(e->device(), e->scalar_type());
-        e->mul_(decay);
-        e->add_(s, 1.0 - decay);
-    }
-
-    auto srcBufs = src->named_buffers(true);
-    auto emaBufs = ema->named_buffers(true);
-
-    for (const auto& kv : srcBufs) {
-        auto* e = emaBufs.find(kv.key());
-        if (!e) continue;
-
-        e->copy_(kv.value().detach().to(e->device(), e->scalar_type()));
-    }
-
-    ema->eval();
-}
 
 static bool ensureOldRunnerReady(const std::string& planFile) {
     std::lock_guard<std::mutex> lk(g_trtOldMutex);
