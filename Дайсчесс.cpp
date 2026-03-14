@@ -4110,58 +4110,86 @@ bool TrtRunner::inferBatchGather(const PendingNN* jobs, int B) {
 // ============================================================
 
 struct InferenceServer {
+    static constexpr int NN_QUEUE_CAP = 8 * TRT_MAX_BATCH; // 2048 for TRT_MAX_BATCH=256
+
     MCTSTable& T;
 
     std::atomic<bool> stop{ false };
     std::atomic<int>  qSize{ 0 };
 
     std::mutex m;
-    std::condition_variable cv;
+    std::condition_variable cvNotEmpty;
+    std::condition_variable cvNotFull;
+    std::condition_variable cvIdle;
 
-    std::deque<PendingNN> q;   // FIFO
+    std::deque<PendingNN> q;
     std::thread th;
+
+    bool busyFlag = false; // protected by m
 
     std::vector<float> neutralPol;     // [POLICY_SIZE]
     std::vector<float> neutralLogits;  // [AI_MAX_MOVES]
 
     explicit InferenceServer(MCTSTable& tab) : T(tab) {
         q.clear();
-        // reserve() not available for deque
         neutralPol.assign((size_t)POLICY_SIZE, 0.0f);
         neutralLogits.assign((size_t)AI_MAX_MOVES, 0.0f);
     }
 
     void start() {
-        stop.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop.store(false, std::memory_order_relaxed);
+            busyFlag = false;
+            q.clear();
+            qSize.store(0, std::memory_order_relaxed);
+        }
         th = std::thread([this] { this->run(); });
     }
 
     void stopAndDrain() {
-        stop.store(true, std::memory_order_relaxed);
-        cv.notify_all();
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop.store(true, std::memory_order_relaxed);
+        }
+        cvNotEmpty.notify_all();
+        cvNotFull.notify_all();
+        cvIdle.notify_all();
+
         if (th.joinable()) th.join();
     }
 
-    int size() const { return qSize.load(std::memory_order_relaxed); }
+    int size() const {
+        return qSize.load(std::memory_order_relaxed);
+    }
 
+    void waitIdle() {
+        std::unique_lock<std::mutex> lk(m);
+        cvIdle.wait(lk, [&] {
+            return q.empty() && !busyFlag;
+        });
+    }
+
+    // Blocking bounded submit.
+    // IMPORTANT: by lifecycle, producers must stop before stopAndDrain().
     void submit(PendingNN&& job) {
-        {
-            std::lock_guard<std::mutex> lk(m);
+        std::unique_lock<std::mutex> lk(m);
 
-            // Pure FIFO:
-            q.emplace_back(std::move(job));
+        cvNotFull.wait(lk, [&] {
+            return stop.load(std::memory_order_relaxed) || (int)q.size() < NN_QUEUE_CAP;
+        });
 
-            // Optional: mild root priority (still no starvation in practice)
-            // if (job.isRoot) q.emplace_front(std::move(job));
-            // else            q.emplace_back(std::move(job));
+        // In normal lifecycle this should not happen while producers are alive.
+        if (stop.load(std::memory_order_relaxed)) return;
 
-            qSize.fetch_add(1, std::memory_order_relaxed);
-        }
-        cv.notify_one();
+        q.emplace_back(std::move(job));
+        qSize.store((int)q.size(), std::memory_order_relaxed);
+
+        lk.unlock();
+        cvNotEmpty.notify_one();
     }
 
 private:
-    // pop up to wantB (caller holds lock)
     int popBatchUnlocked(std::vector<PendingNN>& batch, int wantB) {
         batch.clear();
         batch.reserve((size_t)wantB);
@@ -4172,72 +4200,98 @@ private:
             q.pop_front();
             ++n;
         }
-        if (n) qSize.fetch_sub(n, std::memory_order_relaxed);
+
+        qSize.store((int)q.size(), std::memory_order_relaxed);
         return n;
     }
 
     void run() {
         std::vector<PendingNN> batch;
+        std::vector<PendingNN> add;
         batch.reserve((size_t)TRT_MAX_BATCH);
+        add.reserve((size_t)TRT_MAX_BATCH);
 
-        for (;;) {
-            // 1) wait for at least 1 job (or stop)
-            {
-                std::unique_lock<std::mutex> lk(m);
-                cv.wait(lk, [&] {
-                    return stop.load(std::memory_order_relaxed) || !q.empty();
-                    });
-
-                if (stop.load(std::memory_order_relaxed) && q.empty()) break;
-
-                (void)popBatchUnlocked(batch, TRT_MAX_BATCH);
-            }
-
-            // 2) small fill window to reach 256 if more jobs arrive
-            const auto tFillEnd = std::chrono::steady_clock::now() + std::chrono::microseconds(200);
-            while ((int)batch.size() < TRT_MAX_BATCH &&
-                std::chrono::steady_clock::now() < tFillEnd) {
-
-                std::unique_lock<std::mutex> lk(m);
-                if (q.empty()) {
-                    cv.wait_until(lk, tFillEnd, [&] {
-                        return stop.load(std::memory_order_relaxed) || !q.empty();
-                        });
-                }
-                if (q.empty()) break;
-
-                std::vector<PendingNN> add;
-                const int need = TRT_MAX_BATCH - (int)batch.size();
-                (void)popBatchUnlocked(add, need);
-                lk.unlock();
-
-                for (auto& j : add) batch.emplace_back(std::move(j));
-            }
-
-            const int B = (int)batch.size();
-            if (B <= 0) continue;
+        auto processBatch = [&](std::vector<PendingNN>& jobs) {
+            const int B = (int)jobs.size();
+            if (B <= 0) return;
 
 #if AI_HAVE_CUDA_KERNELS
-            bool ok = g_trt.inferBatchGather(batch.data(), B);
+            bool ok = g_trt.inferBatchGather(jobs.data(), B);
             for (int i = 0; i < B; ++i) {
                 float v = ok ? g_trt.valueHost(i) : 0.5f;
                 const float* logits = ok ? g_trt.gatherLogitsHostPtr(i) : neutralLogits.data();
-                expandLeafWithGatheredLogits(T, batch[(size_t)i], v, logits);
+                expandLeafWithGatheredLogits(T, jobs[(size_t)i], v, logits);
             }
 #else
             std::vector<Position> posBatch((size_t)B);
-            for (int i = 0; i < B; ++i) posBatch[(size_t)i] = batch[(size_t)i].pos;
+            for (int i = 0; i < B; ++i) posBatch[(size_t)i] = jobs[(size_t)i].pos;
 
             bool ok = g_trt.inferBatch(posBatch.data(), B);
             for (int i = 0; i < B; ++i) {
                 float v = ok ? g_trt.valueHost(i) : 0.5f;
                 const float* pol = ok ? g_trt.policyHostPtr(i) : neutralPol.data();
-                expandLeafWithOutputs(T, batch[(size_t)i], v, pol);
+                expandLeafWithOutputs(T, jobs[(size_t)i], v, pol);
             }
 #endif
+        };
+
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(m);
+
+                busyFlag = false;
+                if (q.empty()) cvIdle.notify_all();
+
+                cvNotEmpty.wait(lk, [&] {
+                    return stop.load(std::memory_order_relaxed) || !q.empty();
+                });
+
+                if (stop.load(std::memory_order_relaxed) && q.empty()) break;
+
+                busyFlag = true;
+                (void)popBatchUnlocked(batch, TRT_MAX_BATCH);
+            }
+
+            // queue shrank -> wake blocked producers
+            cvNotFull.notify_all();
+
+            // small fill window to improve batch utilization
+            const auto tFillEnd =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(200);
+
+            while ((int)batch.size() < TRT_MAX_BATCH &&
+                   std::chrono::steady_clock::now() < tFillEnd) {
+                std::unique_lock<std::mutex> lk(m);
+
+                if (q.empty()) {
+                    cvNotEmpty.wait_until(lk, tFillEnd, [&] {
+                        return stop.load(std::memory_order_relaxed) || !q.empty();
+                    });
+                }
+
+                if (q.empty()) break;
+
+                add.clear();
+                const int need = TRT_MAX_BATCH - (int)batch.size();
+                (void)popBatchUnlocked(add, need);
+                lk.unlock();
+
+                cvNotFull.notify_all();
+
+                for (auto& j : add) batch.emplace_back(std::move(j));
+            }
+
+            processBatch(batch);
         }
 
-        // drain not needed: loop already drains until q empty after stop=true
+        {
+            std::lock_guard<std::mutex> lk(m);
+            busyFlag = false;
+            qSize.store((int)q.size(), std::memory_order_relaxed);
+            if (q.empty()) cvIdle.notify_all();
+        }
+
+        cvNotFull.notify_all();
     }
 };
 
@@ -4556,11 +4610,7 @@ void mctsBatchedMT(Position& rootPos,
             if (stop.load(std::memory_order_relaxed)) break;
             if (T.abort.load(std::memory_order_relaxed)) break;
 
-            if (nnServer.size() > 4096) {
-                static thread_local int throttleSpins2 = 0;
-                throttleOnNNQueue_NoSleep(999999, throttleSpins2);
-                continue;
-            }
+            
 
             if ((iter++ & 63ull) == 0ull) {
                 if (std::chrono::steady_clock::now() >= tEnd) break;
@@ -4574,11 +4624,7 @@ void mctsBatchedMT(Position& rootPos,
 
                 PendingNN p;
                 bool needNN = false;
-                static thread_local int throttleSpins = 0;
-                int qs = nnServer.size();
-                throttleOnNNQueue_NoSleep(qs, throttleSpins);
-
-                if (qs > 2000) continue;
+                
 
                 bool ok = runOneSim(T, rootPos, path, mask,
                     p, needNN,
@@ -5233,18 +5279,23 @@ struct InferInFlightGuard {
     ~InferInFlightGuard() { g_inferInFlight.fetch_sub(1, std::memory_order_relaxed); }
 };
 struct InferenceServerTrain {
+    static constexpr int NN_QUEUE_CAP = 8 * TRT_MAX_BATCH; // 2048
+
     MCTSTable& T;
     BackendBinding backend;
 
     std::atomic<bool> stop{ false };
     std::atomic<int>  qSize{ 0 };
-    std::atomic<int>  busy{ 0 };
 
     std::mutex m;
-    std::condition_variable cv;
+    std::condition_variable cvNotEmpty;
+    std::condition_variable cvNotFull;
+    std::condition_variable cvIdle;
 
     std::deque<PendingNN> q;
     std::thread th;
+
+    bool busyFlag = false; // protected by m
 
     std::vector<float> neutralPol;
     std::vector<float> neutralLogits;
@@ -5257,41 +5308,66 @@ struct InferenceServerTrain {
     }
 
     void start() {
-        stop.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop.store(false, std::memory_order_relaxed);
+            busyFlag = false;
+            q.clear();
+            qSize.store(0, std::memory_order_relaxed);
+        }
         th = std::thread([this] { this->run(); });
     }
 
     void requestStop() {
-        stop.store(true, std::memory_order_relaxed);
-        cv.notify_all();
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop.store(true, std::memory_order_relaxed);
+        }
+        cvNotEmpty.notify_all();
+        cvNotFull.notify_all();
+        cvIdle.notify_all();
     }
 
     void join() {
         if (th.joinable()) th.join();
     }
 
-    int size() const { return qSize.load(std::memory_order_relaxed); }
+    int size() const {
+        return qSize.load(std::memory_order_relaxed);
+    }
 
+    // Blocking bounded submit.
+    // IMPORTANT: by lifecycle, producers must stop before requestStop().
     void submit(PendingNN&& job) {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            q.emplace_back(std::move(job));
-            qSize.fetch_add(1, std::memory_order_relaxed);
-        }
-        cv.notify_one();
+        std::unique_lock<std::mutex> lk(m);
+
+        cvNotFull.wait(lk, [&] {
+            return stop.load(std::memory_order_relaxed) || (int)q.size() < NN_QUEUE_CAP;
+        });
+
+        // In normal lifecycle this should not happen while workers are alive.
+        if (stop.load(std::memory_order_relaxed)) return;
+
+        q.emplace_back(std::move(job));
+        qSize.store((int)q.size(), std::memory_order_relaxed);
+
+        lk.unlock();
+        cvNotEmpty.notify_one();
     }
 
     void waitIdle() {
-        for (;;) {
-            if (size() == 0 && busy.load(std::memory_order_relaxed) == 0) break;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
+        std::unique_lock<std::mutex> lk(m);
+        cvIdle.wait(lk, [&] {
+            return q.empty() && !busyFlag;
+        });
     }
 
     void clearQueueUnsafeWhenIdle() {
         std::lock_guard<std::mutex> lk(m);
         q.clear();
         qSize.store(0, std::memory_order_relaxed);
+        cvNotFull.notify_all();
+        if (!busyFlag) cvIdle.notify_all();
     }
 
 private:
@@ -5305,7 +5381,8 @@ private:
             q.pop_front();
             ++n;
         }
-        if (n) qSize.fetch_sub(n, std::memory_order_relaxed);
+
+        qSize.store((int)q.size(), std::memory_order_relaxed);
         return n != 0;
     }
 
@@ -5382,30 +5459,36 @@ private:
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(m);
-                busy.store(0, std::memory_order_relaxed);
 
-                cv.wait(lk, [&] {
+                busyFlag = false;
+                if (q.empty()) cvIdle.notify_all();
+
+                cvNotEmpty.wait(lk, [&] {
                     return stop.load(std::memory_order_relaxed) || !q.empty();
                 });
 
                 if (stop.load(std::memory_order_relaxed) && q.empty()) break;
 
-                busy.store(1, std::memory_order_relaxed);
+                busyFlag = true;
                 (void)popBatchUnlocked(batch, TRT_MAX_BATCH);
             }
+
+            // queue shrank -> wake blocked producers
+            cvNotFull.notify_all();
 
             const auto tFillEnd =
                 std::chrono::steady_clock::now() + std::chrono::microseconds(200);
 
             while ((int)batch.size() < TRT_MAX_BATCH &&
-                std::chrono::steady_clock::now() < tFillEnd) {
-
+                   std::chrono::steady_clock::now() < tFillEnd) {
                 std::unique_lock<std::mutex> lk(m);
+
                 if (q.empty()) {
-                    cv.wait_until(lk, tFillEnd, [&] {
+                    cvNotEmpty.wait_until(lk, tFillEnd, [&] {
                         return stop.load(std::memory_order_relaxed) || !q.empty();
                     });
                 }
+
                 if (q.empty()) break;
 
                 add.clear();
@@ -5413,24 +5496,36 @@ private:
                 (void)popBatchUnlocked(add, need);
                 lk.unlock();
 
+                cvNotFull.notify_all();
+
                 for (auto& j : add) batch.emplace_back(std::move(j));
             }
 
             processBatch(batch);
         }
 
+        // drain tail after stop request
         for (;;) {
             std::vector<PendingNN> tail;
             {
                 std::lock_guard<std::mutex> lk(m);
                 if (q.empty()) break;
-                busy.store(1, std::memory_order_relaxed);
+                busyFlag = true;
                 (void)popBatchUnlocked(tail, TRT_MAX_BATCH);
             }
+
+            cvNotFull.notify_all();
             processBatch(tail);
         }
 
-        busy.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            busyFlag = false;
+            qSize.store((int)q.size(), std::memory_order_relaxed);
+            if (q.empty()) cvIdle.notify_all();
+        }
+
+        cvNotFull.notify_all();
     }
 };
 
@@ -5545,80 +5640,71 @@ struct SearchPool {
     }
 
 private:
-    void workerMain(unsigned tid) {
-        int myJob = 0;
-        uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
+void workerMain(unsigned tid) {
+    int myJob = 0;
+    uint32_t jitterBase = (uint32_t)(0x9E3779B9u * (tid + 1));
 
+    for (;;) {
+        MCTSTable* TT = nullptr;
+        InferenceServerTrain* server = nullptr;
+        const Position* rp = nullptr;
+        const std::array<uint64_t, 4>* pth = nullptr;
+        const std::array<int, 64>* msk = nullptr;
+
+        {
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait(lk, [&] { return stop || jobId != myJob; });
+            if (stop) return;
+
+            myJob = jobId;
+            TT = T;
+            server = srv;
+            rp = rootPos;
+            pth = path;
+            msk = mask;
+        }
+
+        if (!TT || TT->abort.load(std::memory_order_relaxed)) {
+            workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        int k = 0;
         for (;;) {
-            MCTSTable* TT = nullptr;
-            InferenceServerTrain* server = nullptr;
-            const Position* rp = nullptr;
-            const std::array<uint64_t, 4>* pth = nullptr;
-            const std::array<int, 64>* msk = nullptr;
+            if (TT->abort.load(std::memory_order_relaxed)) break;
+            if (cancelJob.load(std::memory_order_relaxed)) break;
 
-            {
-                std::unique_lock<std::mutex> lk(m);
-                cv.wait(lk, [&] { return stop || jobId != myJob; });
-                if (stop) return;
+            // claim exactly one simulation budget item
+            if (!tryClaimSimBudget(simsLeft)) break;
 
-                myJob = jobId;
-                TT = T;
-                server = srv;
-                rp = rootPos;
-                pth = path;
-                msk = mask;
-            }
+            PendingNN p;
+            bool needNN = false;
 
-            if (!TT || TT->abort.load(std::memory_order_relaxed)) {
-                workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            bool ok = runOneSim(*TT, *rp, *pth, *msk,
+                                p, needNN,
+                                jitterBase + (uint32_t)(k++) * 1337u);
+
+            if (!ok) {
+                // simulation did not actually happen -> give budget back
+                refundSimBudget(simsLeft);
+
+                if (TT->abort.load(std::memory_order_relaxed)) break;
+                if (cancelJob.load(std::memory_order_relaxed)) break;
+
+                cpuRelax();
                 continue;
             }
 
-            // execute sims
-int k = 0;
-for (;;) {
-    if (TT->abort.load(std::memory_order_relaxed)) break;
-    if (cancelJob.load(std::memory_order_relaxed)) break;
-
-    // avoid unbounded queue growth
-    static thread_local int throttleSpins = 0;
-    int qs = server ? server->size() : 0;
-    throttleOnNNQueue_NoSleep(qs, throttleSpins);
-
-    // IMPORTANT:
-    // do NOT spend sim budget while we are only throttling on NN queue pressure
-    if (qs > 2000) {
-        cpuRelax();
-        continue;
-    }
-
-    // claim exactly one simulation budget item
-    if (!tryClaimSimBudget(simsLeft)) break;
-
-    PendingNN p;
-    bool needNN = false;
-
-    bool ok = runOneSim(*TT, *rp, *pth, *msk,
-        p, needNN,
-        jitterBase + (uint32_t)(k++) * 1337u);
-
-    if (!ok) {
-        // simulation did not actually happen -> give budget back
-        refundSimBudget(simsLeft);
-
-        if (TT->abort.load(std::memory_order_relaxed)) break;
-        if (cancelJob.load(std::memory_order_relaxed)) break;
-
-        cpuRelax();
-        continue;
-    }
-
-    if (needNN && server) server->submit(std::move(p));
-}
-
-            workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            if (needNN && server) {
+                // bounded blocking submit:
+                // backpressure is handled here instead of busy-wait on queue size
+                server->submit(std::move(p));
+            }
         }
+
+        workersBusy.fetch_sub(1, std::memory_order_relaxed);
     }
+}
 };
 
 // ------------------------------------------------------------
