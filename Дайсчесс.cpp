@@ -6424,10 +6424,13 @@ double   warmupStartFactor = 0.10;         // 0.05..0.25 usually good
     std::unique_ptr<torch::optim::AdamW> opt;
 
     // CPU staging (pinned if CUDA)
-    torch::Tensor xCPU, idxCPU, probCPU, zCPU;
+    torch::Tensor xCPU, idxCPU, probCPU, zCPU, nPiCPU;
 
     // Device tensors (allocated once)
-    torch::Tensor xDev, idxDev, probDev, zDev;
+    torch::Tensor xDev, idxDev, probDev, zDev, nPiDev;
+
+    // [1, AI_MAX_MOVES] => 0..254 on the active device
+    torch::Tensor slotIdsDev;
 
     // State
     uint64_t steps = 0;
@@ -6516,7 +6519,7 @@ void init(Net& model, Net& emaModel) {
         emaModel->eval();
     }
 
-    // NEW: AdamW with no weight decay on BN / bias
+    // AdamW with no weight decay on BN / bias
     std::vector<torch::Tensor> decayParams;
     std::vector<torch::Tensor> noDecayParams;
 
@@ -6573,158 +6576,147 @@ void init(Net& model, Net& emaModel) {
         return ten;
     };
 
-    xCPU = makeCPU({ B, NN_SQ_PLANES, 8, 8 }, torch::kFloat32);
-    idxCPU = makeCPU({ B, AI_MAX_MOVES }, torch::kInt64);
-    probCPU = makeCPU({ B, AI_MAX_MOVES }, torch::kFloat32);
-    zCPU = makeCPU({ B, 1 }, torch::kFloat32);
+    xCPU   = makeCPU({ B, NN_SQ_PLANES, 8, 8 }, torch::kFloat32);
+    idxCPU = makeCPU({ B, AI_MAX_MOVES },       torch::kInt64);
+    probCPU= makeCPU({ B, AI_MAX_MOVES },       torch::kFloat32);
+    zCPU   = makeCPU({ B, 1 },                  torch::kFloat32);
+    nPiCPU = makeCPU({ B },                     torch::kInt64);
 
     if (useCuda) {
-        xDev = torch::empty({ B, NN_SQ_PLANES, 8, 8 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        idxDev = torch::empty({ B, AI_MAX_MOVES }, torch::TensorOptions().dtype(torch::kInt64).device(device));
-        probDev = torch::empty({ B, AI_MAX_MOVES }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        zDev = torch::empty({ B, 1 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        xDev   = torch::empty({ B, NN_SQ_PLANES, 8, 8 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        idxDev = torch::empty({ B, AI_MAX_MOVES },       torch::TensorOptions().dtype(torch::kInt64).device(device));
+        probDev= torch::empty({ B, AI_MAX_MOVES },       torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        zDev   = torch::empty({ B, 1 },                  torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        nPiDev = torch::empty({ B },                     torch::TensorOptions().dtype(torch::kInt64).device(device));
     }
     else {
-        xDev = xCPU; idxDev = idxCPU; probDev = probCPU; zDev = zCPU;
+        xDev   = xCPU;
+        idxDev = idxCPU;
+        probDev= probCPU;
+        zDev   = zCPU;
+        nPiDev = nPiCPU;
     }
+
+    // slot ids for masking legal part: [1, 255] = 0..254
+    slotIdsDev = torch::arange(
+        AI_MAX_MOVES,
+        torch::TensorOptions().dtype(torch::kInt64).device(device)
+    ).view({ 1, AI_MAX_MOVES });
 }
 
-    // Train block with a strict time budget.
-    int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
-        int budgetMs,
-        int maxStepsHard,
+int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
+    int budgetMs,
+    int maxStepsHard,
     int warmupBatches = 1000) {
-        if (budgetMs <= 0 || maxStepsHard <= 0) return 0;
+    if (budgetMs <= 0 || maxStepsHard <= 0) return 0;
 
-        const size_t need = (size_t)B * (size_t)std::max(1, warmupBatches);
-        if (rb.currentSize() < need) return 0;
+    const size_t need = (size_t)B * (size_t)std::max(1, warmupBatches);
+    if (rb.currentSize() < need) return 0;
 
-        const auto tEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+    const auto tEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
 
-        std::vector<TrainSample> batch;
-        batch.reserve((size_t)B);
+    std::vector<TrainSample> batch;
+    batch.reserve((size_t)B);
 
-        int done = 0;
+    int done = 0;
 
-        // Distributions outside inner loops (micro-optimization + cleaner)
-        std::bernoulli_distribution coin(0.5);
+    for (int it = 0; it < maxStepsHard; ++it) {
+        if (std::chrono::steady_clock::now() >= tEnd) break;
+        if (!rb.sampleBatch(batch, B, rng)) break;
 
-        for (int it = 0; it < maxStepsHard; ++it) {
-            if (std::chrono::steady_clock::now() >= tEnd) break;
-            if (!rb.sampleBatch(batch, B, rng)) break;
+        // ---- Fill CPU staging ----
+        float*   xp = xCPU.data_ptr<float>();
+        int64_t* ip = idxCPU.data_ptr<int64_t>();
+        float*   pp = probCPU.data_ptr<float>();
+        float*   zp = zCPU.data_ptr<float>();
+        int64_t* np = nPiCPU.data_ptr<int64_t>();
 
-            // ---- Fill CPU staging ----
-            float* xp = xCPU.data_ptr<float>();
-            int64_t* ip = idxCPU.data_ptr<int64_t>();
-            float* pp = probCPU.data_ptr<float>();
-            float* zp = zCPU.data_ptr<float>();
+        for (int i = 0; i < B; ++i) {
+            const TrainSample& s = batch[(size_t)i];
 
-            for (int i = 0; i < B; ++i) {
-                const TrainSample& s = batch[(size_t)i];
+            NNInput enc;
+            positionToNNInput(s.pos, enc);
 
-                NNInput enc;
-                positionToNNInput(s.pos, enc);
+            std::memcpy(
+                xp + (size_t)i * (size_t)NN_INPUT_SIZE,
+                enc.data(),
+                (size_t)NN_INPUT_SIZE * sizeof(float)
+            );
 
-                std::memcpy(xp + (size_t)i * (size_t)NN_INPUT_SIZE,
-                    enc.data(),
-                    (size_t)NN_INPUT_SIZE * sizeof(float));
+            np[(size_t)i] = (int64_t)s.nPi;
 
-                // sparse policy target packed into fixed 255 slots (rest are already 0 in samples)
-                for (int j = 0; j < AI_MAX_MOVES; ++j) {
-                    ip[(size_t)i * (size_t)AI_MAX_MOVES + (size_t)j] = (int64_t)s.piIdx[(size_t)j];
-                    pp[(size_t)i * (size_t)AI_MAX_MOVES + (size_t)j] = s.piProb[(size_t)j];
-                }
-
-                // zCPU is [B,1] contiguous, so zp[i] is fine
-                zp[(size_t)i] = s.z;
+            // fixed 255 slots; padded part is allowed, but must have prob=0
+            for (int j = 0; j < AI_MAX_MOVES; ++j) {
+                ip[(size_t)i * (size_t)AI_MAX_MOVES + (size_t)j] = (int64_t)s.piIdx[(size_t)j];
+                pp[(size_t)i * (size_t)AI_MAX_MOVES + (size_t)j] = s.piProb[(size_t)j];
             }
 
+            zp[(size_t)i] = s.z;
+        }
 
-            
+        // ---- H2D (no realloc) ----
+        if (useCuda) {
+            xDev.copy_(xCPU,   /*non_blocking=*/true);
+            idxDev.copy_(idxCPU, /*non_blocking=*/true);
+            probDev.copy_(probCPU, /*non_blocking=*/true);
+            zDev.copy_(zCPU,   /*non_blocking=*/true);
+            nPiDev.copy_(nPiCPU, /*non_blocking=*/true);
+        }
 
-            // ---- H2D (no realloc) ----
-            if (useCuda) {
-                xDev.copy_(xCPU, /*non_blocking=*/true);
-                idxDev.copy_(idxCPU, /*non_blocking=*/true);
-                probDev.copy_(probCPU, /*non_blocking=*/true);
-                zDev.copy_(zCPU, /*non_blocking=*/true);
+        float lossScalar = 0.0f;
+        float lossPScalar = 0.0f;
+        float lossVScalar = 0.0f;
+        float gradNormScalar = 0.0f;
+        bool didStep = false;
+
+        {
+            std::lock_guard<std::mutex> lk(g_modelMutex);
+
+            opt->zero_grad();
+
+            auto runForwardLoss = [&]() {
+                auto out = model->forward(xDev);
+                auto pol = out.first;         // [B,73,8,8]
+                auto valLogits = out.second;  // [B,1]
+
+                // ---- POLICY LOSS over LEGAL MOVES ONLY ----
+                // Gather only the 255 packed slots, then mask [0..nPi-1].
+                auto polFlat = pol.flatten(1).to(torch::kFloat32);   // [B,4672]
+                auto gathered = polFlat.gather(1, idxDev);           // [B,255]
+
+                auto validMask = slotIdsDev.lt(nPiDev.view({ -1, 1 })); // [B,255], bool
+                auto masked = gathered.masked_fill(torch::logical_not(validMask), -1e30f);
+
+                auto logp_valid = torch::log_softmax(masked, 1);     // [B,255]
+                auto lossP = -(probDev * logp_valid).sum(1).mean();
+
+                // ---- VALUE LOSS ----
+                auto lossV = torch::binary_cross_entropy_with_logits(
+                    valLogits.to(torch::kFloat32),
+                    zDev
+                );
+
+                auto loss = lossP + lossV;
+                return std::make_tuple(loss, lossP, lossV);
+            };
+
+            torch::Tensor loss, lossP, lossV;
+
+            if (useAmp) {
+                CudaAutocastGuard ampGuard(true, ampDtype);
+                std::tie(loss, lossP, lossV) = runForwardLoss();
+            } else {
+                std::tie(loss, lossP, lossV) = runForwardLoss();
             }
 
-            float lossScalar = 0.0f;
-            float lossPScalar = 0.0f;
-            float lossVScalar = 0.0f;
-            float gradNormScalar = 0.0f;
-            bool didStep = false;
-
-            {
-                std::lock_guard<std::mutex> lk(g_modelMutex);
-
-                opt->zero_grad();
-
-                auto runForwardLoss = [&]() {
-                    auto out = model->forward(xDev);
-                    auto pol = out.first;         // [B,73,8,8]
-                    auto valLogits = out.second;  // [B,1]
-
-                    // Keep numerically sensitive reductions in fp32.
-                    auto polFlat = pol.flatten(1).to(torch::kFloat32); // [B,4672]
-                    auto logp = torch::log_softmax(polFlat, 1);
-                    auto g = logp.gather(1, idxDev);                   // [B,255]
-
-                    auto lossP = -(probDev * g).sum(1).mean();
-
-                    auto lossV = torch::binary_cross_entropy_with_logits(
-                        valLogits.to(torch::kFloat32),
-                        zDev
-                    );
-
-                    auto loss = lossP + lossV;
-                    return std::make_tuple(loss, lossP, lossV);
-                };
-
-                torch::Tensor loss, lossP, lossV;
-
+            const bool finiteLoss = torch::isfinite(loss).all().item<bool>();
+            if (finiteLoss) {
                 if (useAmp) {
-                    CudaAutocastGuard ampGuard(true, ampDtype);
-                    std::tie(loss, lossP, lossV) = runForwardLoss();
-                } else {
-                    std::tie(loss, lossP, lossV) = runForwardLoss();
-                }
+                    scaler.scaleLoss(loss).backward();
 
-                const bool finiteLoss = torch::isfinite(loss).all().item<bool>();
-                if (finiteLoss) {
-                    if (useAmp) {
-                        scaler.scaleLoss(loss).backward();
+                    bool gradsFinite = scaler.unscaleAndCheckFinite(model->parameters());
 
-                        bool gradsFinite = scaler.unscaleAndCheckFinite(model->parameters());
-
-                        if (gradsFinite) {
-                            double currentGradNorm =
-                                torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
-
-                            if (std::isfinite(currentGradNorm)) {
-                                opt->step();
-                                emaUpdate(emaModel, model, ema_decay);
-
-                                lossScalar = loss.item<float>();
-                                lossPScalar = lossP.item<float>();
-                                lossVScalar = lossV.item<float>();
-                                gradNormScalar = static_cast<float>(currentGradNorm);
-                                didStep = true;
-                            } else {
-                                gradsFinite = false;
-                            }
-                        }
-
-                        scaler.update(gradsFinite);
-                        lastAmpScale = scaler.scale;
-
-                        if (!didStep) {
-                            ++ampSkippedSteps;
-                        }
-                    } else {
-                        loss.backward();
-
+                    if (gradsFinite) {
                         double currentGradNorm =
                             torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
 
@@ -6737,35 +6729,61 @@ void init(Net& model, Net& emaModel) {
                             lossVScalar = lossV.item<float>();
                             gradNormScalar = static_cast<float>(currentGradNorm);
                             didStep = true;
+                        } else {
+                            gradsFinite = false;
                         }
                     }
-                } else {
-                    if (useAmp) {
-                        scaler.update(false);
-                        lastAmpScale = scaler.scale;
+
+                    scaler.update(gradsFinite);
+                    lastAmpScale = scaler.scale;
+
+                    if (!didStep) {
                         ++ampSkippedSteps;
                     }
+                } else {
+                    loss.backward();
+
+                    double currentGradNorm =
+                        torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+
+                    if (std::isfinite(currentGradNorm)) {
+                        opt->step();
+                        emaUpdate(emaModel, model, ema_decay);
+
+                        lossScalar = loss.item<float>();
+                        lossPScalar = lossP.item<float>();
+                        lossVScalar = lossV.item<float>();
+                        gradNormScalar = static_cast<float>(currentGradNorm);
+                        didStep = true;
+                    }
+                }
+            } else {
+                if (useAmp) {
+                    scaler.update(false);
+                    lastAmpScale = scaler.scale;
+                    ++ampSkippedSteps;
                 }
             }
-
-            if (!didStep) break;
-
-            ++done;
-            ++steps;
-            lastLoss = lossScalar;
-            lastLossP = lossPScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
-            lastLossV = lossVScalar; // <--- ОБНОВЛЯЕМ STATE ТРЕНЕРА
-            lastGradNorm = gradNormScalar;
-            updateLR();
         }
 
-        if (useCuda) {
-            try { torch::cuda::synchronize(); }
-            catch (...) {}
-        }
+        if (!didStep) break;
 
-        return done;
+        ++done;
+        ++steps;
+        lastLoss = lossScalar;
+        lastLossP = lossPScalar;
+        lastLossV = lossVScalar;
+        lastGradNorm = gradNormScalar;
+        updateLR();
     }
+
+    if (useCuda) {
+        try { torch::cuda::synchronize(); }
+        catch (...) {}
+    }
+
+    return done;
+}
 };
 // init / load / save
 // ------------------------------------------------------------
