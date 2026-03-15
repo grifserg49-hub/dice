@@ -3213,6 +3213,7 @@ static AI_FORCEINLINE void cpuRelax() {
 // -------------------------------
 static constexpr int64_t AI_LOCK_WAIT_US = 2000;   // 2ms (как было)
 static constexpr int64_t AI_EXPAND_WAIT_US = 100000;
+static constexpr int64_t AI_SUBMIT_WAIT_US = 200;  // short timed wait for cancelable submit
 
 static AI_FORCEINLINE void backoffWait(int& spins) {
     cpuRelax();
@@ -4221,17 +4222,22 @@ struct InferenceServer {
         });
     }
 
-    // Blocking bounded submit.
-    // IMPORTANT: by lifecycle, producers must stop before stopAndDrain().
-    bool submit(PendingNN&& job) {
+    bool submit(PendingNN&& job,
+                const std::atomic<bool>* extCancel = nullptr,
+                const std::atomic<bool>* extAbort  = nullptr) {
+        auto cancelled = [&]() -> bool {
+            return stop.load(std::memory_order_relaxed) ||
+                   (extCancel && extCancel->load(std::memory_order_relaxed)) ||
+                   (extAbort && extAbort->load(std::memory_order_relaxed));
+        };
+
         std::unique_lock<std::mutex> lk(m);
 
-        cvNotFull.wait(lk, [&] {
-            return stop.load(std::memory_order_relaxed) || (int)q.size() < NN_QUEUE_CAP;
-        });
+        while ((int)q.size() >= NN_QUEUE_CAP && !cancelled()) {
+            cvNotFull.wait_for(lk, std::chrono::microseconds(AI_SUBMIT_WAIT_US));
+        }
 
-        // In normal lifecycle this should not happen while producers are alive.
-        if (stop.load(std::memory_order_relaxed)) return false;
+        if (cancelled()) return false;
 
         q.emplace_back(std::move(job));
         qSize.store((int)q.size(), std::memory_order_relaxed);
@@ -4712,7 +4718,7 @@ auto worker = [&](unsigned tid) {
                     break;
                 }
 
-                if (!nnServer.submit(std::move(p))) {
+                if (!nnServer.submit(std::move(p), &stop, &T.abort)) {
                     cancelPendingNN(p);
                     simFail.fetch_add(1, std::memory_order_relaxed);
                     if (T.abort.load(std::memory_order_relaxed)) break;
@@ -5426,15 +5432,22 @@ struct InferenceServerTrain {
 
     // Blocking bounded submit.
     // IMPORTANT: by lifecycle, producers must stop before requestStop().
-    bool submit(PendingNN&& job) {
+    bool submit(PendingNN&& job,
+                const std::atomic<bool>* extCancel = nullptr,
+                const std::atomic<bool>* extAbort  = nullptr) {
+        auto cancelled = [&]() -> bool {
+            return stop.load(std::memory_order_relaxed) ||
+                   (extCancel && extCancel->load(std::memory_order_relaxed)) ||
+                   (extAbort && extAbort->load(std::memory_order_relaxed));
+        };
+
         std::unique_lock<std::mutex> lk(m);
 
-        cvNotFull.wait(lk, [&] {
-            return stop.load(std::memory_order_relaxed) || (int)q.size() < NN_QUEUE_CAP;
-        });
+        while ((int)q.size() >= NN_QUEUE_CAP && !cancelled()) {
+            cvNotFull.wait_for(lk, std::chrono::microseconds(AI_SUBMIT_WAIT_US));
+        }
 
-        // In normal lifecycle this should not happen while workers are alive.
-        if (stop.load(std::memory_order_relaxed)) return false;
+        if (cancelled()) return false;
 
         q.emplace_back(std::move(job));
         qSize.store((int)q.size(), std::memory_order_relaxed);
@@ -5933,7 +5946,7 @@ if (needNN && server) {
         break;
     }
 
-    if (!server->submit(std::move(p))) {
+    if (!server->submit(std::move(p), &cancelJob, &TT->abort)) {
         cancelPendingNN(p);
 
         if (!fatal.load(std::memory_order_relaxed) &&
@@ -6720,6 +6733,12 @@ void init(Net& model, Net& emaModel) {
     const size_t decayCount = decayParams.size();
     const size_t noDecayCount = noDecayParams.size();
 
+    if (decayParams.empty() && noDecayParams.empty()) {
+        throw std::runtime_error("Trainer::init(): model has no trainable parameters");
+    }
+
+    // Base optimizer group:
+    // prefer decayParams as the main group; if empty, bootstrap from noDecayParams.
     if (!decayParams.empty()) {
         opt = std::make_unique<torch::optim::AdamW>(
             decayParams,
@@ -6730,33 +6749,21 @@ void init(Net& model, Net& emaModel) {
             noDecayParams,
             torch::optim::AdamWOptions(initial_lr).weight_decay(0.0)
         );
-        noDecayParams.clear();
+        noDecayParams.clear(); // already used as base group
     }
 
-if (!decayParams.empty()) {
-    opt = std::make_unique<torch::optim::AdamW>(
-        decayParams,
-        torch::optim::AdamWOptions(initial_lr).weight_decay(wd)
-    );
-} else {
-    opt = std::make_unique<torch::optim::AdamW>(
-        noDecayParams,
-        torch::optim::AdamWOptions(initial_lr).weight_decay(0.0)
-    );
-    noDecayParams.clear();
-}
+    // Add no-decay group only if it wasn't already consumed above.
+    if (!noDecayParams.empty()) {
+        auto opts = torch::optim::AdamWOptions(initial_lr);
+        opts.weight_decay(0.0);
 
-if (!noDecayParams.empty()) {
-    auto opts = torch::optim::AdamWOptions(initial_lr);
-    opts.weight_decay(0.0);
+        torch::optim::OptimizerParamGroup g(
+            noDecayParams,
+            std::make_unique<torch::optim::AdamWOptions>(opts)
+        );
 
-    torch::optim::OptimizerParamGroup g(
-        noDecayParams,
-        std::make_unique<torch::optim::AdamWOptions>(opts)
-    );
-
-    opt->add_param_group(std::move(g));
-}
+        opt->add_param_group(std::move(g));
+    }
 
     std::cerr << "[Trainer] AdamW groups: decay=" << decayCount
               << " no_decay=" << noDecayCount << "\n";
