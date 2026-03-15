@@ -3962,6 +3962,75 @@ static void restoreTemporaryRootNoise(RootNoiseBackup& bk) {
     bk.n = 0;
 }
 
+struct RootNoiseGuard {
+    RootNoiseBackup bk;
+
+    RootNoiseGuard(MCTSTable& T,
+                   const Position& rootPos,
+                   bool enabled) {
+        applyTemporaryRootNoise(T, rootPos, enabled, bk);
+    }
+
+    ~RootNoiseGuard() noexcept {
+        restoreTemporaryRootNoise(bk);
+    }
+
+    RootNoiseGuard(const RootNoiseGuard&) = delete;
+    RootNoiseGuard& operator=(const RootNoiseGuard&) = delete;
+};
+
+struct AtomicStopGuard {
+    std::atomic<bool>* flag = nullptr;
+
+    explicit AtomicStopGuard(std::atomic<bool>& f) : flag(&f) {}
+
+    ~AtomicStopGuard() noexcept {
+        if (flag) flag->store(true, std::memory_order_relaxed);
+    }
+
+    void release() noexcept { flag = nullptr; }
+
+    AtomicStopGuard(const AtomicStopGuard&) = delete;
+    AtomicStopGuard& operator=(const AtomicStopGuard&) = delete;
+};
+
+struct ThreadJoinGuard {
+    std::vector<std::thread>* threads = nullptr;
+
+    explicit ThreadJoinGuard(std::vector<std::thread>& v) : threads(&v) {}
+
+    ~ThreadJoinGuard() noexcept {
+        if (!threads) return;
+        for (auto& th : *threads) {
+            if (th.joinable()) th.join();
+        }
+    }
+
+    void release() noexcept { threads = nullptr; }
+
+    ThreadJoinGuard(const ThreadJoinGuard&) = delete;
+    ThreadJoinGuard& operator=(const ThreadJoinGuard&) = delete;
+};
+
+struct InferenceServerStopGuard {
+    InferenceServer* srv = nullptr;
+
+    explicit InferenceServerStopGuard(InferenceServer& s) : srv(&s) {}
+
+    ~InferenceServerStopGuard() noexcept {
+        if (!srv) return;
+        try {
+            srv->stopAndDrain();
+        } catch (...) {
+        }
+    }
+
+    void release() noexcept { srv = nullptr; }
+
+    InferenceServerStopGuard(const InferenceServerStopGuard&) = delete;
+    InferenceServerStopGuard& operator=(const InferenceServerStopGuard&) = delete;
+};
+
 
 // ============================================================
 // Old expansion: policy logits in CHW [pl][sq] (4672 floats)
@@ -4647,11 +4716,11 @@ void mctsBatchedMT(Position& rootPos,
         return;
     }
 
-    RootNoiseBackup rootNoiseBk;
-    applyTemporaryRootNoise(T, rootPos, rootNoise, rootNoiseBk);
+    RootNoiseGuard rootNoiseGuard(T, rootPos, rootNoise);
 
     InferenceServer nnServer(T);
     nnServer.start();
+    InferenceServerStopGuard nnServerGuard(nnServer);
 
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     const unsigned threads = std::max(1u, hw / 2);
@@ -4660,6 +4729,8 @@ void mctsBatchedMT(Position& rootPos,
     const auto tEnd = t0 + std::chrono::duration<double>(timeSec);
 
     std::atomic<bool> stop{ false };
+    AtomicStopGuard stopGuard(stop);
+
     std::atomic<uint64_t> simOK{ 0 }, simFail{ 0 }, nnExp{ 0 };
 
 auto worker = [&](unsigned tid) {
@@ -4735,7 +4806,11 @@ auto worker = [&](unsigned tid) {
 
     std::vector<std::thread> pool;
     pool.reserve(threads);
-    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker, t);
+    ThreadJoinGuard poolGuard(pool);
+
+    for (unsigned t = 0; t < threads; ++t) {
+        pool.emplace_back(worker, t);
+    }
 
     while (std::chrono::steady_clock::now() < tEnd) {
         if (T.abort.load(std::memory_order_relaxed)) break;
@@ -4744,9 +4819,12 @@ auto worker = [&](unsigned tid) {
     stop.store(true, std::memory_order_relaxed);
 
     for (auto& th : pool) th.join();
-    nnServer.stopAndDrain();
+    poolGuard.release();
 
-    restoreTemporaryRootNoise(rootNoiseBk);
+    nnServer.stopAndDrain();
+    nnServerGuard.release();
+
+    stopGuard.release();
 
     float qRoot = nodeQ(*rootNode);
     outEvalWhite = (rootPos.side == 0) ? qRoot : (1.0f - qRoot);
@@ -5725,7 +5803,7 @@ AI_FORCEINLINE void noteProgress() {
         return fatalReason;
     }
 
-    [[noreturn]] void failFast(const std::string& reason, MCTSTable* tt = nullptr) {
+    void requestFailFastNoThrow(const std::string& reason, MCTSTable* tt = nullptr) noexcept {
         bool wasFatal = fatal.exchange(true, std::memory_order_acq_rel);
         if (!wasFatal) {
             std::lock_guard<std::mutex> lk(fatalM);
@@ -5744,10 +5822,44 @@ AI_FORCEINLINE void noteProgress() {
         cancelJob.store(true, std::memory_order_relaxed);
         simsLeft.store(0, std::memory_order_relaxed);
         cv.notify_all();
+    }
+
+    bool isPoolThreadId(std::thread::id id) const noexcept {
+        for (const auto& th : pool) {
+            if (th.joinable() && th.get_id() == id) return true;
+        }
+        return false;
+    }
+
+    void joinAllWorkersNoexcept() noexcept {
+        const auto self = std::this_thread::get_id();
 
         for (auto& th : pool) {
-            if (th.joinable()) th.join();
+            if (!th.joinable()) continue;
+            if (th.get_id() == self) continue;
+
+            try {
+                th.join();
+            } catch (...) {
+            }
         }
+    }
+
+    void requestFailFast(const std::string& reason, MCTSTable* tt = nullptr) noexcept {
+        requestFailFastNoThrow(reason, tt);
+    }
+
+    void failFast(const std::string& reason, MCTSTable* tt = nullptr) {
+        requestFailFastNoThrow(reason, tt);
+
+        // failFast() должен бросать только из управляющего потока.
+        // Если кто-то случайно вызовет его из worker thread, просто не бросаем:
+        // worker должен завершиться, а управляющий поток увидит fatal и сам бросит.
+        if (isPoolThreadId(std::this_thread::get_id())) {
+            return;
+        }
+
+        joinAllWorkersNoexcept();
         pool.clear();
 
         throw std::runtime_error("[SearchPool] FATAL: " + getFatalReason());
@@ -5802,6 +5914,10 @@ void runSims(MCTSTable& TT,
     auto lastWarnAt = Clock::time_point::min();
 
     for (;;) {
+        if (isFatal()) {
+            failFast(getFatalReason(), &TT);
+        }
+
         const int busy = workersBusy.load(std::memory_order_relaxed);
         if (busy == 0) break;
 
@@ -5863,6 +5979,10 @@ void runSims(MCTSTable& TT,
 
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
+
+    if (isFatal()) {
+        failFast(getFatalReason(), &TT);
+    }
 }
 private:
 void workerMain(unsigned tid) {
@@ -5876,92 +5996,121 @@ void workerMain(unsigned tid) {
         const std::array<uint64_t, 4>* pth = nullptr;
         const std::array<int, 64>* msk = nullptr;
 
-        {
-            std::unique_lock<std::mutex> lk(m);
-            cv.wait(lk, [&] {
-                return stop || jobId != myJob;
-            });
+        bool busyAccounted = false;
 
-            if (stop) return;
+        try {
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] {
+                    return stop || jobId != myJob;
+                });
 
-            myJob = jobId;
-            TT = T;
-            server = srv;
-            rp = rootPos;
-            pth = path;
-            msk = mask;
-        }
+                if (stop) return;
 
-        if (!TT || TT->abort.load(std::memory_order_relaxed)) {
-            workersBusy.fetch_sub(1, std::memory_order_relaxed);
-            continue;
-        }
+                myJob = jobId;
+                TT = T;
+                server = srv;
+                rp = rootPos;
+                pth = path;
+                msk = mask;
+            }
 
-        int k = 0;
-        int queueSpins = 0;
+            busyAccounted = true;
 
-        for (;;) {
-            if (fatal.load(std::memory_order_relaxed)) break;
-            if (TT->abort.load(std::memory_order_relaxed)) break;
-            if (cancelJob.load(std::memory_order_relaxed)) break;
+            if (!TT || TT->abort.load(std::memory_order_relaxed)) {
+                workersBusy.fetch_sub(1, std::memory_order_relaxed);
+                busyAccounted = false;
+                continue;
+            }
 
-            // Front-pressure: don't create more NN work while queue is overloaded.
-            if (server) {
-                throttleOnNNQueue_NoSleep(server->size(), queueSpins);
+            int k = 0;
+            int queueSpins = 0;
 
+            for (;;) {
                 if (fatal.load(std::memory_order_relaxed)) break;
                 if (TT->abort.load(std::memory_order_relaxed)) break;
                 if (cancelJob.load(std::memory_order_relaxed)) break;
+
+                if (server) {
+                    throttleOnNNQueue_NoSleep(server->size(), queueSpins);
+
+                    if (fatal.load(std::memory_order_relaxed)) break;
+                    if (TT->abort.load(std::memory_order_relaxed)) break;
+                    if (cancelJob.load(std::memory_order_relaxed)) break;
+                }
+
+                if (!tryClaimSimBudget(simsLeft)) break;
+
+                PendingNN p;
+                bool needNN = false;
+
+                bool ok = runOneSim(*TT, *rp, *pth, *msk,
+                                    p, needNN,
+                                    jitterBase + (uint32_t)(k++) * 1337u);
+
+                if (!ok) {
+                    refundSimBudget(simsLeft);
+
+                    if (fatal.load(std::memory_order_relaxed)) break;
+                    if (TT->abort.load(std::memory_order_relaxed)) break;
+                    if (cancelJob.load(std::memory_order_relaxed)) break;
+
+                    cpuRelax();
+                    continue;
+                }
+
+                noteProgress();
+
+                if (needNN && server) {
+                    throttleOnNNQueue_NoSleep(server->size(), queueSpins);
+
+                    if (fatal.load(std::memory_order_relaxed) ||
+                        cancelJob.load(std::memory_order_relaxed) ||
+                        TT->abort.load(std::memory_order_relaxed)) {
+                        cancelPendingNN(p);
+                        break;
+                    }
+
+                    if (!server->submit(std::move(p), &cancelJob, &TT->abort)) {
+                        cancelPendingNN(p);
+
+                        if (!fatal.load(std::memory_order_relaxed) &&
+                            !cancelJob.load(std::memory_order_relaxed) &&
+                            !TT->abort.load(std::memory_order_relaxed)) {
+                            refundSimBudget(simsLeft);
+                        }
+                        break;
+                    }
+
+                    noteProgress();
+                }
             }
 
-            if (!tryClaimSimBudget(simsLeft)) break;
-
-            PendingNN p;
-            bool needNN = false;
-
-bool ok = runOneSim(*TT, *rp, *pth, *msk,
-                    p, needNN,
-                    jitterBase + (uint32_t)(k++) * 1337u);
-
-if (!ok) {
-    refundSimBudget(simsLeft);
-
-    if (fatal.load(std::memory_order_relaxed)) break;
-    if (TT->abort.load(std::memory_order_relaxed)) break;
-    if (cancelJob.load(std::memory_order_relaxed)) break;
-
-    cpuRelax();
-    continue;
-}
-
-noteProgress();
-
-if (needNN && server) {
-    throttleOnNNQueue_NoSleep(server->size(), queueSpins);
-
-    if (fatal.load(std::memory_order_relaxed) ||
-        cancelJob.load(std::memory_order_relaxed) ||
-        TT->abort.load(std::memory_order_relaxed)) {
-        cancelPendingNN(p);
-        break;
-    }
-
-    if (!server->submit(std::move(p), &cancelJob, &TT->abort)) {
-        cancelPendingNN(p);
-
-        if (!fatal.load(std::memory_order_relaxed) &&
-            !cancelJob.load(std::memory_order_relaxed) &&
-            !TT->abort.load(std::memory_order_relaxed)) {
-            refundSimBudget(simsLeft);
+            workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            busyAccounted = false;
         }
-        break;
-    }
+        catch (const std::exception& e) {
+            if (busyAccounted) {
+                workersBusy.fetch_sub(1, std::memory_order_relaxed);
+                busyAccounted = false;
+            }
 
-    noteProgress();
-}
+            std::ostringstream oss;
+            oss << "workerMain tid=" << tid << " exception: " << e.what();
+            requestFailFast(oss.str(), TT);
+            return;
         }
+        catch (...) {
+            if (busyAccounted) {
+                workersBusy.fetch_sub(1, std::memory_order_relaxed);
+                busyAccounted = false;
+            }
 
-        workersBusy.fetch_sub(1, std::memory_order_relaxed);
+            std::ostringstream oss;
+            oss << "workerMain tid=" << tid << " unknown exception";
+            requestFailFast(oss.str(), TT);
+            return;
+        }
     }
 }
 };
@@ -6108,14 +6257,14 @@ static int pickMoveFromVisits(const std::vector<moveState>& mv, float temperatur
 
     if (!(temperature > 1e-6f)) return mv[0].move;
 
+    const double invTemp = 1.0 / (double)temperature;
+
     double sum = 0.0;
-    std::vector<double> w(mv.size());
     for (size_t i = 0; i < mv.size(); ++i) {
-        double v = (double)std::max(0, mv[i].visits);
-        double ww = std::pow(v + 1e-9, 1.0 / (double)temperature);
-        w[i] = ww;
-        sum += ww;
+        const double v = (double)std::max(0, mv[i].visits);
+        sum += std::pow(v + 1e-9, invTemp);
     }
+
     if (!(sum > 0.0)) return mv[0].move;
 
     std::uniform_real_distribution<double> d(0.0, sum);
@@ -6123,9 +6272,11 @@ static int pickMoveFromVisits(const std::vector<moveState>& mv, float temperatur
 
     double acc = 0.0;
     for (size_t i = 0; i < mv.size(); ++i) {
-        acc += w[i];
+        const double v = (double)std::max(0, mv[i].visits);
+        acc += std::pow(v + 1e-9, invTemp);
         if (r <= acc) return mv[i].move;
     }
+
     return mv.back().move;
 }
 
@@ -6179,14 +6330,11 @@ static void runFixedSims(MCTSTable& T,
     ensureExpandedTrain(T, backend, rootPos, path, mask);
     if (T.abort.load(std::memory_order_relaxed)) return;
 
-    RootNoiseBackup rootNoiseBk;
-    applyTemporaryRootNoise(T, rootPos, rootNoise, rootNoiseBk);
+    RootNoiseGuard rootNoiseGuard(T, rootPos, rootNoise);
 
     pool.runSims(T, srv, rootPos, path, mask, sims);
 
     srv.waitIdle();
-
-    restoreTemporaryRootNoise(rootNoiseBk);
 }
 
 // ------------------------------------------------------------
