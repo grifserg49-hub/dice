@@ -5761,22 +5761,78 @@ AI_FORCEINLINE void noteProgress() {
 
     unsigned threads = 1;
 
-    void start(unsigned nThreads) {
+void start(unsigned nThreads) {
+    if (!pool.empty()) {
+        throw std::logic_error("SearchPool::start() called while pool is already running");
+    }
+
+    const unsigned newThreads = std::max(1u, nThreads);
+    std::vector<std::thread> newPool;
+    newPool.reserve(newThreads);
+
+    // Prepare clean "starting" state before workers begin.
+    {
+        std::lock_guard<std::mutex> lk(m);
         stop = false;
-        cancelJob.store(false, std::memory_order_relaxed);
-        fatal.store(false, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lk(fatalM);
-            fatalReason.clear();
-        }
 
-        threads = std::max(1u, nThreads);
-        pool.reserve(threads);
+        // no active job at startup
+        T = nullptr;
+        srv = nullptr;
+        rootPos = nullptr;
+        path = nullptr;
+        mask = nullptr;
+        jobId = 0;
+    }
 
-        for (unsigned tid = 0; tid < threads; ++tid) {
-            pool.emplace_back([this, tid] { this->workerMain(tid); });
+    cancelJob.store(false, std::memory_order_relaxed);
+    fatal.store(false, std::memory_order_relaxed);
+    workersBusy.store(0, std::memory_order_relaxed);
+    simsLeft.store(0, std::memory_order_relaxed);
+    progressTick.store(0, std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lk(fatalM);
+        fatalReason.clear();
+    }
+
+    try {
+        for (unsigned tid = 0; tid < newThreads; ++tid) {
+            newPool.emplace_back([this, tid] { this->workerMain(tid); });
         }
     }
+    catch (...) {
+        // Stop and wake any workers that were already created.
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+        }
+
+        cancelJob.store(true, std::memory_order_relaxed);
+        simsLeft.store(0, std::memory_order_relaxed);
+        cv.notify_all();
+
+        for (auto& th : newPool) {
+            if (th.joinable()) th.join();
+        }
+
+        // Restore inert state.
+        {
+            std::lock_guard<std::mutex> lk(m);
+            T = nullptr;
+            srv = nullptr;
+            rootPos = nullptr;
+            path = nullptr;
+            mask = nullptr;
+            jobId = 0;
+        }
+
+        workersBusy.store(0, std::memory_order_relaxed);
+        throw;
+    }
+
+    pool = std::move(newPool);
+    threads = newThreads;
+}
 
     void shutdown() {
         {
