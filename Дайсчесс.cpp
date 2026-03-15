@@ -6733,13 +6733,30 @@ void init(Net& model, Net& emaModel) {
         noDecayParams.clear();
     }
 
-    if (!noDecayParams.empty()) {
-        torch::optim::OptimizerParamGroup g(noDecayParams);
-        auto& o = static_cast<torch::optim::AdamWOptions&>(g.options());
-        o.lr(initial_lr);
-        o.weight_decay(0.0);
-        opt->add_param_group(std::move(g));
-    }
+if (!decayParams.empty()) {
+    opt = std::make_unique<torch::optim::AdamW>(
+        decayParams,
+        torch::optim::AdamWOptions(initial_lr).weight_decay(wd)
+    );
+} else {
+    opt = std::make_unique<torch::optim::AdamW>(
+        noDecayParams,
+        torch::optim::AdamWOptions(initial_lr).weight_decay(0.0)
+    );
+    noDecayParams.clear();
+}
+
+if (!noDecayParams.empty()) {
+    auto opts = torch::optim::AdamWOptions(initial_lr);
+    opts.weight_decay(0.0);
+
+    torch::optim::OptimizerParamGroup g(
+        noDecayParams,
+        std::make_unique<torch::optim::AdamWOptions>(opts)
+    );
+
+    opt->add_param_group(std::move(g));
+}
 
     std::cerr << "[Trainer] AdamW groups: decay=" << decayCount
               << " no_decay=" << noDecayCount << "\n";
