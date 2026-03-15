@@ -6545,23 +6545,15 @@ struct SimpleGradScaler {
         return loss * scale;
     }
 
-    bool unscaleAndCheckFinite(const std::vector<torch::Tensor>& params) {
-        if (!enabled) return true;
+    void unscale(const std::vector<torch::Tensor>& params) {
+        if (!enabled) return;
 
         const float invScale = 1.0f / scale;
-        bool finite = true;
-
         for (const auto& p : params) {
             auto g = p.grad();
             if (!g.defined()) continue;
-
             g.mul_(invScale);
-
-            if (!torch::isfinite(g).all().item<bool>()) {
-                finite = false;
-            }
         }
-        return finite;
     }
 
     void update(bool gradsFinite) {
@@ -6951,52 +6943,50 @@ auto runForwardLoss = [&]() {
 
             const bool finiteLoss = torch::isfinite(loss).all().item<bool>();
             if (finiteLoss) {
-                if (useAmp) {
-                    scaler.scaleLoss(loss).backward();
+if (useAmp) {
+    scaler.scaleLoss(loss).backward();
 
-                    bool gradsFinite = scaler.unscaleAndCheckFinite(model->parameters());
+    scaler.unscale(model->parameters());
 
-                    if (gradsFinite) {
-                        double currentGradNorm =
-                            torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+    double currentGradNorm =
+        torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
 
-                        if (std::isfinite(currentGradNorm)) {
-                            opt->step();
-                            emaUpdate(emaModel, model, ema_decay);
+    bool gradsFinite = std::isfinite(currentGradNorm);
 
-                            lossScalar = loss.item<float>();
-                            lossPScalar = lossP.item<float>();
-                            lossVScalar = lossV.item<float>();
-                            gradNormScalar = static_cast<float>(currentGradNorm);
-                            didStep = true;
-                        } else {
-                            gradsFinite = false;
-                        }
-                    }
+    if (gradsFinite) {
+        opt->step();
+        emaUpdate(emaModel, model, ema_decay);
 
-                    scaler.update(gradsFinite);
-                    lastAmpScale = scaler.scale;
+        lossScalar = loss.item<float>();
+        lossPScalar = lossP.item<float>();
+        lossVScalar = lossV.item<float>();
+        gradNormScalar = static_cast<float>(currentGradNorm);
+        didStep = true;
+    }
 
-                    if (!didStep) {
-                        ++ampSkippedSteps;
-                    }
-                } else {
-                    loss.backward();
+    scaler.update(gradsFinite);
+    lastAmpScale = scaler.scale;
 
-                    double currentGradNorm =
-                        torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+    if (!didStep) {
+        ++ampSkippedSteps;
+    }
+} else {
+    loss.backward();
 
-                    if (std::isfinite(currentGradNorm)) {
-                        opt->step();
-                        emaUpdate(emaModel, model, ema_decay);
+    double currentGradNorm =
+        torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
 
-                        lossScalar = loss.item<float>();
-                        lossPScalar = lossP.item<float>();
-                        lossVScalar = lossV.item<float>();
-                        gradNormScalar = static_cast<float>(currentGradNorm);
-                        didStep = true;
-                    }
-                }
+    if (std::isfinite(currentGradNorm)) {
+        opt->step();
+        emaUpdate(emaModel, model, ema_decay);
+
+        lossScalar = loss.item<float>();
+        lossPScalar = lossP.item<float>();
+        lossVScalar = lossV.item<float>();
+        gradNormScalar = static_cast<float>(currentGradNorm);
+        didStep = true;
+    }
+}
             } else {
                 if (useAmp) {
                     scaler.update(false);
