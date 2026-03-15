@@ -6856,30 +6856,65 @@ int trainBlockBudgetMs(ReplayBuffer& rb, Net& model, Net& emaModel,
 
             opt->zero_grad();
 
-            auto runForwardLoss = [&]() {
-                auto out = model->forward(xDev);
-                auto pol = out.first;         // [B,73,8,8]
-                auto valLogits = out.second;  // [B,1]
+auto runForwardLoss = [&]() {
+    auto out = model->forward(xDev);
+    auto pol = out.first;         // [B,73,8,8]
+    auto valLogits = out.second;  // [B,1]
 
-                // ---- POLICY LOSS over LEGAL MOVES ONLY ----
-                auto polFlat = pol.flatten(1).to(torch::kFloat32);   // [B,4672]
-                auto gathered = polFlat.gather(1, idxDev);           // [B,255]
+    // =========================================================
+    // POLICY LOSS over LEGAL MOVES ONLY (SAFE VERSION)
+    // =========================================================
 
-                auto validMask = slotIdsDev.lt(nPiDev.view({ -1, 1 })); // [B,255], bool
-                auto masked = gathered.masked_fill(torch::logical_not(validMask), -1e30f);
+    // Always compute policy loss in FP32, even under AMP.
+    // This avoids FP16 saturation to -Inf on masked logits.
+    auto polFlat = pol.flatten(1).to(torch::kFloat32); // [B, POLICY_SIZE]
 
-                auto logp_valid = torch::log_softmax(masked, 1);     // [B,255]
-                auto lossP = -(probDev * logp_valid).sum(1).mean();
+    // Clamp nPi to valid range just in case.
+    auto nPiClamped = nPiDev.clamp(0, AI_MAX_MOVES);   // [B], int64
 
-                // ---- VALUE LOSS ----
-                auto lossV = torch::binary_cross_entropy_with_logits(
-                    valLogits.to(torch::kFloat32),
-                    zDev
-                );
+    // validMask[b, j] == true iff slot j is a real legal move for sample b
+    auto validMask = slotIdsDev.lt(nPiClamped.view({ -1, 1 })); // [B, AI_MAX_MOVES], bool
 
-                auto loss = lossP + lossV;
-                return std::make_tuple(loss, lossP, lossV);
-            };
+    // Safety for gather:
+    // padded / corrupted indices must not crash gather.
+    auto idxSafe = idxDev.clamp(0, POLICY_SIZE - 1);   // [B, AI_MAX_MOVES], int64
+
+    auto gathered = polFlat.gather(1, idxSafe);        // [B, AI_MAX_MOVES], FP32
+
+    // IMPORTANT:
+    // use a large finite negative number, not -inf.
+    // Since gathered is FP32 here, -1e9 is perfectly safe.
+    constexpr float kMaskedLogit = -1e9f;
+    auto maskedLogits = gathered.masked_fill(torch::logical_not(validMask), kMaskedLogit);
+
+    // log-softmax over move slots
+    auto logp_valid = torch::log_softmax(maskedLogits, 1); // [B, AI_MAX_MOVES], FP32
+
+    // Zero out invalid target slots explicitly.
+    // This prevents any chance of 0 * (-inf) style NaNs if code changes later.
+    auto tgtProb = probDev.to(torch::kFloat32)
+        .masked_fill(torch::logical_not(validMask), 0.0f); // [B, AI_MAX_MOVES]
+
+    // Per-row policy CE
+    auto rowLossP = -(tgtProb * logp_valid).sum(1); // [B]
+
+    // Ignore rows with nPi == 0 instead of letting them distort the mean.
+    auto rowHasTarget = nPiClamped.gt(0).to(torch::kFloat32); // [B]
+    auto denomP = rowHasTarget.sum().clamp_min(1.0f);
+
+    auto lossP = (rowLossP * rowHasTarget).sum() / denomP;
+
+    // =========================================================
+    // VALUE LOSS (also in FP32)
+    // =========================================================
+    auto lossV = torch::binary_cross_entropy_with_logits(
+        valLogits.to(torch::kFloat32),
+        zDev.to(torch::kFloat32)
+    );
+
+    auto loss = lossP + lossV;
+    return std::make_tuple(loss, lossP, lossV);
+};
 
             torch::Tensor loss, lossP, lossV;
 
